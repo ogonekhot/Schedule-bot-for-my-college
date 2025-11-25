@@ -1,11 +1,12 @@
 import aiomysql
+import config
 
 async def connect():
     conn = await aiomysql.connect(
-        host='*****',
-        user='*****',
-        password='*****',
-        db='*****'
+        host=config.DB_HOST,
+        user=config.DB_USER,
+        password=config.DB_PASSWORD,
+        db=config.DB_NAME
     )
 
     return conn
@@ -40,3 +41,13 @@ async def check_tg_id(tg_id):
             user_id = await cur.fetchone()
 
     return list(user_id)
+
+async def update_user_settings(user_id, field, value):
+    conn = await connect()
+
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute(f"UPDATE settings SET {field}=%s WHERE id=%s", (value, user_id))
+            await conn.commit()
+    except Exception as e:
+        return "Ошибка: " + str(e)
