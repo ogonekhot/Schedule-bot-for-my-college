@@ -41,7 +41,7 @@ except:
 
 try:
     with open(rf"{config.BASE_DIR}/settings/addresses.json", "r", encoding="utf_8_sig") as f:
-        addresses = json.loads(f.read())
+        adresses = json.loads(f.read())
 except:
     print('Не удалось загрузить адреса')
 
@@ -66,9 +66,50 @@ async def check_registration(event):
         await message('Для начала выберите вашу группу:', reply_markup=buttons.as_markup())
 
         return False
-
     return True
 
+async def schedule_updater(user_id, date = arrow.now().format("DD.MM.YYYY")):
+    group = (await dbm.check_tg_id(user_id))[1]
+    day, color = await tm.get_this_weekday(settings["references"]["date"], settings["references"]["color"], date=date)
+    
+    text = f'<b>{day} - {color} ({arrow.get(date, "DD.MM.YYYY").format("DD.MM")})</b>\n\n'
+
+    try:
+        schedule_fd = schedule[group][day]
+        count = 0
+
+        for i in schedule_fd.keys():
+            if schedule_fd[i][color]["title"] != '' or schedule_fd[i][color]["teacher"] != '':
+                count += 1
+                text += f'{count}-я пара <b>{schedule_fd[i]["time"]["start"]} - {schedule_fd[i]["time"]["end"]}</b>:\n'
+
+                if schedule_fd[i][color]["title"] != '':
+                    text += f'{schedule_fd[i][color]["title"]}\n'
+
+                if schedule_fd[i][color]["teacher"] != '':
+                    text += f'{schedule_fd[i][color]["teacher"]}\n'
+
+                if schedule_fd[i][color]["room"] != '':
+                    for corpuse in adresses.keys():
+                        adress = None
+                        
+                        for flore in adresses[corpuse].keys():
+                            if str(schedule_fd[i][color]["room"]).isdigit():
+                                if int(adresses[corpuse][flore]["min"]) <= int(schedule_fd[i][color]["room"]) <= int(adresses[corpuse][flore]["max"]):
+                                    adress = f'{corpuse} {schedule_fd[i][color]["room"]} {schedule_fd[i][color]["type"]}'
+                            elif str(schedule_fd[i][color]["room"])[:2] == '9-':
+                                adress = f'9-й корпус {str(schedule_fd[i][color]["room"])[2:]} {schedule_fd[i][color]["type"]}'
+                            else:
+                                adress = f'{schedule_fd[i][color]["room"]} {schedule_fd[i][color]["type"]}'
+
+                        if adress != None:
+                            break
+                        
+                    text += f'{adress}\n\n'
+    except:
+        text += 'Выходной'
+
+    return text
 
 @dp.message(CommandStart())
 @dp.callback_query(F.data == 'back')
@@ -100,43 +141,8 @@ async def schedule_manager(callback: types.CallbackQuery):
         buttons = InlineKeyboardBuilder()
         buttons.row(InlineKeyboardButton(text = '⏪', callback_data = f'schedule_{await tm.get_next_previous(temp[1], "e_p")}'), InlineKeyboardButton(text = '◀️', callback_data = f'schedule_{await tm.get_next_previous(temp[1], "p")}'), InlineKeyboardButton(text = '🔄️', callback_data = f'schedule'), InlineKeyboardButton(text = '▶️', callback_data = f'schedule_{await tm.get_next_previous(temp[1], "n")}'), InlineKeyboardButton(text = '⏩', callback_data = f'schedule_{await tm.get_next_previous(temp[1], "e_n")}'))
         buttons.row(InlineKeyboardButton(text = 'Назад', callback_data = 'back'))
-        group = (await dbm.check_tg_id(callback.from_user.id))[1]
-        day, color = await tm.get_this_weekday(settings["references"]["date"], settings["references"]["color"], date=temp[1])
         
-        text = f'<b>{day} - {color} ({arrow.get(temp[1], "DD.MM.YYYY").format("DD.MM")})</b>\n\n'
-
-        try:
-            schedule_fd = schedule[group][day]
-            count = 0
-
-            for i in schedule_fd.keys():
-                if schedule_fd[i][color]["title"] != '' or schedule_fd[i][color]["teacher"] != '':
-                    count += 1
-                    text += f'{count}-я пара <b>{schedule_fd[i]["time"]["start"]} - {schedule_fd[i]["time"]["end"]}</b>:\n'
-
-                    if schedule_fd[i][color]["title"] != '':
-                        text += f'{schedule_fd[i][color]["title"]}\n'
-
-                    if schedule_fd[i][color]["teacher"] != '':
-                        text += f'{schedule_fd[i][color]["teacher"]}\n'
-
-                    if schedule_fd[i][color]["room"] != '':
-                        for corpuse in addresses.keys():
-                            for flore in addresses[corpuse].keys():
-                                if str(schedule_fd[i][color]["room"]).isdigit():
-                                    if int(addresses[corpuse][flore]["min"]) <= int(schedule_fd[i][color]["room"]) <= int(addresses[corpuse][flore]["max"]):
-                                        adress = f'{corpuse} {schedule_fd[i][color]["room"]} {schedule_fd[i][color]["type"]}'
-                                elif str(schedule_fd[i][color]["room"])[:2] == '9-':
-                                    adress = f'9-й корпус {str(schedule_fd[i][color]["room"])[2:]} {schedule_fd[i][color]["type"]}'
-                                else:
-                                    adress = f'{schedule_fd[i][color]["room"]} {schedule_fd[i][color]["type"]}'
-                            
-                            if 'adress' in locals():
-                                break
-
-                        text += f'{adress}\n\n'
-        except:
-            text += 'Выходной'
+        text = await schedule_updater(callback.from_user.id, temp[1])
 
         try:
             await callback.message.edit_text(text, reply_markup=buttons.as_markup(), parse_mode='HTML')
