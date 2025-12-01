@@ -30,20 +30,20 @@ scheduler = AsyncIOScheduler()
 try:
     with open(rf"{config.BASE_DIR}/settings/global.json", "r", encoding="utf_8_sig") as f:
         settings = json.loads(f.read())
-except:
-    print('Не удалось загрузить глобальные настройки')
+except BaseException as e:
+    raise f'Не удалось загрузить глобальные настройки: {e}'
 
 try:
     with open(rf"{config.BASE_DIR}/settings/schedule.json", "r", encoding="utf_8_sig") as f:
         schedule = json.loads(f.read())
-except:
-    print('Не удалось загрузить расписание')
+except BaseException as e:
+    raise f'Не удалось загрузить расписание: {e}'
 
 try:
     with open(rf"{config.BASE_DIR}/settings/addresses.json", "r", encoding="utf_8_sig") as f:
         adresses = json.loads(f.read())
-except:
-    print('Не удалось загрузить адреса')
+except BaseException as e:
+    raise f'Не удалось загрузить адреса: {e}'
 
 #########################################################################################
 #                                 Основная логика бота                                  #
