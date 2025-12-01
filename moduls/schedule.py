@@ -6,6 +6,9 @@ import json
 import arrow
 import config
 
+white = 'Белая неделя'
+green = 'Зелёная неделя'
+
 async def update_schedule():
     schedule = {}
 
@@ -81,12 +84,12 @@ async def update_schedule():
                             elif ' - ' in clean:
                                 time = clean.split(' - ')
                                 count += 1
-                                schedule[group][list(schedule[group].keys())[-1]][str(count)] = {'time': {'start': time[0], 'end': time[1]}, 'Белая неделя': {'title': '', 'teacher': '', 'room': '', 'type': ''}, 'Зелёная неделя': {'title': '', 'teacher': '', 'room': '', 'type': ''}}
+                                schedule[group][list(schedule[group].keys())[-1]][str(count)] = {'time': {'start': time[0], 'end': time[1]}, white: {'title': '', 'teacher': '', 'room': '', 'type': ''}, green: {'title': '', 'teacher': '', 'room': '', 'type': ''}}
                             else:
                                 if 'bgGreen' not in i.get('class'):
-                                    tmp = schedule[group][list(schedule[group].keys())[-1]][str(count)]['Белая неделя']
+                                    tmp = schedule[group][list(schedule[group].keys())[-1]][str(count)][white]
                                 elif 'bgGreen' in i.get('class'):
-                                    tmp = schedule[group][list(schedule[group].keys())[-1]][str(count)]['Зелёная неделя']
+                                    tmp = schedule[group][list(schedule[group].keys())[-1]][str(count)][green]
 
                                 if len(str(i).split('<br/>')) == 2:
                                     tmp['room'] = bleach.clean(str(i).split('<br/>')[0], tags=[], strip=True).strip()
@@ -116,7 +119,8 @@ async def update_schedule():
         json.dump(schedule, f, ensure_ascii=False, indent=4)
 
     settings['references']['date'] = arrow.now().format('DD.MM.YYYY')
-    settings['references']['color'] = 'Белая неделя' if 'белая' in weak_color else 'Зелёная неделя'
+    settings['references']['color'] = white if 'белая' in weak_color else green
 
     with open(rf"{config.BASE_DIR}/settings/global.json", 'w', encoding='utf-8') as f:
         json.dump(settings, f, ensure_ascii=False, indent=4)
+
