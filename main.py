@@ -97,7 +97,7 @@ async def schedule_updater(user_id, date = arrow.now().format("DD.MM.YYYY")):
                             if str(schedule_fd[i][color]["room"]).isdigit():
                                 if int(adresses[corpuse][flore]["min"]) <= int(schedule_fd[i][color]["room"]) <= int(adresses[corpuse][flore]["max"]):
                                     adress = f'{corpuse} {schedule_fd[i][color]["room"]} {schedule_fd[i][color]["type"]}'
-                            elif str(schedule_fd[i][color]["room"])[:2] == '9-':
+                            elif str(schedule_fd[i][color]["room"]).startswith('9-'):
                                 adress = f'9-й корпус {str(schedule_fd[i][color]["room"])[2:]} {schedule_fd[i][color]["type"]}'
                             else:
                                 adress = f'{schedule_fd[i][color]["room"]} {schedule_fd[i][color]["type"]}'
