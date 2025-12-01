@@ -124,13 +124,13 @@ async def start(event: types.Message | types.CallbackQuery):
     buttons = InlineKeyboardBuilder()
 
     if await check_registration(event) == True:
-        buttons.row(InlineKeyboardButton(text = 'Расписание', callback_data = f'schedule'))
+        buttons.row(InlineKeyboardButton(text = 'Расписание', callback_data = 'schedule'))
         if user_data[2] == 1:
-            buttons.row(InlineKeyboardButton(text = 'Админ панель', callback_data = f'admin'))
+            buttons.row(InlineKeyboardButton(text = 'Админ панель', callback_data = 'admin'))
 
         await message(f'С возвращением, {event.from_user.full_name}!', reply_markup=buttons.as_markup())
 
-@dp.callback_query(F.data[:8] == 'schedule')
+@dp.callback_query(str(F.data).startswith('schedule'))
 async def schedule_manager(callback: types.CallbackQuery):
     if await check_registration(callback) == True:
         temp = callback.data.split('_')
@@ -139,7 +139,7 @@ async def schedule_manager(callback: types.CallbackQuery):
             temp.append(arrow.now().format("DD.MM.YYYY"))
 
         buttons = InlineKeyboardBuilder()
-        buttons.row(InlineKeyboardButton(text = '⏪', callback_data = f'schedule_{await tm.get_next_previous(temp[1], "e_p")}'), InlineKeyboardButton(text = '◀️', callback_data = f'schedule_{await tm.get_next_previous(temp[1], "p")}'), InlineKeyboardButton(text = '🔄️', callback_data = f'schedule'), InlineKeyboardButton(text = '▶️', callback_data = f'schedule_{await tm.get_next_previous(temp[1], "n")}'), InlineKeyboardButton(text = '⏩', callback_data = f'schedule_{await tm.get_next_previous(temp[1], "e_n")}'))
+        buttons.row(InlineKeyboardButton(text = '⏪', callback_data = f'schedule_{await tm.get_next_previous(temp[1], "e_p")}'), InlineKeyboardButton(text = '◀️', callback_data = f'schedule_{await tm.get_next_previous(temp[1], "p")}'), InlineKeyboardButton(text = '🔄️', callback_data = 'schedule'), InlineKeyboardButton(text = '▶️', callback_data = f'schedule_{await tm.get_next_previous(temp[1], "n")}'), InlineKeyboardButton(text = '⏩', callback_data = f'schedule_{await tm.get_next_previous(temp[1], "e_n")}'))
         buttons.row(InlineKeyboardButton(text = 'Назад', callback_data = 'back'))
         
         text = await schedule_updater(callback.from_user.id, temp[1])
@@ -149,7 +149,7 @@ async def schedule_manager(callback: types.CallbackQuery):
         except:
             await callback.answer('Ничего не изменилось...', show_alert=False)
 
-@dp.callback_query(F.data[:8] == 'settings')
+@dp.callback_query(str(F.data).startswith('settings'))
 async def settings_manager(callback: types.CallbackQuery):
     temp = callback.data.split('_')
     
@@ -158,10 +158,8 @@ async def settings_manager(callback: types.CallbackQuery):
 
     await start(callback)
 
-@dp.callback_query(F.data[:5] == 'admin')
+@dp.callback_query(str(F.data).startswith('admin'))
 async def profile_manager(callback: types.CallbackQuery):
-    temp = callback.data.split('_')
-
     buttons = InlineKeyboardBuilder()
     buttons.row(InlineKeyboardButton(text = 'Назад', callback_data = 'back'))
 
