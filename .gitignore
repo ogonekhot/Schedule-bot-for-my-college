@@ -1,15 +1,4 @@
-trash/123
-settings/settings.json
-trash/test.py
-trash/Systems.py
-trash/bot.py
-123.py
 moduls/db.py
-moduls/__pycache__/db.cpython-313.pyc
-moduls/__pycache__/task.cpython-313.pyc
-moduls/__pycache__/time.cpython-313.pyc
-moduls/schedule/__pycache__/schedule_manager.cpython-313.pyc
-moduls/schedule/__pycache__/schedule.cpython-313.pyc
-__pycache__/config.cpython-313.pyc
-config.py
-123 (копия с компьютера DESKTOP-49N1CPB).py
+moduls/__pycache__
+moduls/schedule/__pycache__/
+__pycache__
