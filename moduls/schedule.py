@@ -9,6 +9,36 @@ import config
 white = 'Белая неделя'
 green = 'Зелёная неделя'
 
+LOGIN_URL = "http://lk.stu.lipetsk.ru/"
+SCHEDULE_URL = "http://lk.stu.lipetsk.ru/education/0/5:136841076/"
+
+
+async def login_and_validate(page, login, password) -> tuple[bool, str | None]:
+    await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    await asyncio.sleep(2)
+    await page.wait_for_load_state("networkidle")
+
+    await page.fill('input[name="LOGIN"]', login)
+    await page.fill('input[name="PASSWORD"]', password)
+    await page.click('button[type="submit"]')
+
+    await page.wait_for_load_state("domcontentloaded")
+    await asyncio.sleep(2)
+    await page.wait_for_load_state("networkidle")
+
+    login_form_visible = await page.locator('input[name="LOGIN"]').is_visible()
+    if login_form_visible:
+        error_message = None
+        for selector in ('.alert', '.alert-danger', '.error', '.msg'):
+            node = page.locator(selector).first
+            if await node.count():
+                error_message = (await node.text_content() or '').strip()
+                if error_message:
+                    break
+        return False, error_message or "Не удалось войти: логин/пароль отклонены."
+
+    return True, None
+
 async def update_schedule():
     schedule = {}
 
@@ -25,25 +55,20 @@ async def update_schedule():
             browser = await p.firefox.launch(headless=False)
             page = await browser.new_page()
 
-            await page.goto("http://lk.stu.lipetsk.ru/", wait_until="domcontentloaded")
-            await asyncio.sleep(2)
-            await page.wait_for_load_state("networkidle")
+            is_valid, error_message = await login_and_validate(page, login, password)
+            if not is_valid:
+                print(f"Ошибка авторизации для группы {group}: {error_message}")
+                await browser.close()
+                continue
 
-            await page.fill('input[name="LOGIN"]', login)
-            await page.fill('input[name="PASSWORD"]', password)
-            
-            await page.click('button[type="submit"]')
-
-            await page.wait_for_load_state("domcontentloaded")
-            await asyncio.sleep(2)
-            await page.wait_for_load_state("networkidle")
-
-            while True:
+            attempts = 3
+            weak_color = None
+            for attempt in range(1, attempts + 1):
                 try:
-                    await page.goto("http://lk.stu.lipetsk.ru/education/0/5:136841076/", wait_until="domcontentloaded")
+                    await page.goto(SCHEDULE_URL, wait_until="domcontentloaded")
                     await asyncio.sleep(2)
                     await page.wait_for_load_state("networkidle")
-                    
+
                     col = 0
                     ajax_response = ''
 
@@ -65,10 +90,8 @@ async def update_schedule():
                     await asyncio.sleep(2)
                     await page.wait_for_load_state("networkidle")
 
-                    weak_color = await page.query_selector('div[role=alert]')
-                    weak_color = await weak_color.text_content()
-
-                    await browser.close()
+                    weak_color_node = await page.query_selector('div[role=alert]')
+                    weak_color = await weak_color_node.text_content()
 
                     soup = BeautifulSoup(ajax_response, 'html.parser')
                     s = soup.find('tbody')
@@ -111,15 +134,17 @@ async def update_schedule():
                                     tmp['title'] = bleach.clean(str(i), tags=[], strip=True).strip().capitalize()
                     break
                 except Exception as e:
-                    print(f"Ошибка при получении расписания для группы {group}: {e}")
-            
+                    print(f"Ошибка при получении расписания для группы {group} (попытка {attempt}/{attempts}): {e}")
+
             await browser.close()
+            if weak_color is None:
+                continue
 
     with open(rf"{config.BASE_DIR}/settings/schedule.json", 'w', encoding='utf-8') as f:
         json.dump(schedule, f, ensure_ascii=False, indent=4)
 
     settings['references']['date'] = arrow.now().format('DD.MM.YYYY')
-    settings['references']['color'] = white if 'белая' in weak_color else green
+    settings['references']['color'] = white if weak_color and 'белая' in weak_color.lower() else green
 
     with open(rf"{config.BASE_DIR}/settings/global.json", 'w', encoding='utf-8') as f:
         json.dump(settings, f, ensure_ascii=False, indent=4)
