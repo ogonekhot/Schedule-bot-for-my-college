@@ -19,6 +19,7 @@ from playwright.async_api import (
     Browser,
     Page,
     Response,
+    Route,
     async_playwright,
 )
 from playwright.async_api import (
@@ -39,6 +40,9 @@ LESSON_TYPES = {
     "лек.": "лекция",
     "лаб.": "лабораторная",
 }
+STALLED_RESOURCE_PATTERNS = (
+    "**/local/templates/main/assets/js/bootstrap.min.js*",
+)
 
 
 class ScheduleUpdateError(RuntimeError):
@@ -195,6 +199,13 @@ async def _fetch_group(
     page = await context.new_page()
     timeout_ms = config.SCHEDULE_PAGE_TIMEOUT_SECONDS * 1000
     page.set_default_timeout(timeout_ms)
+
+    async def abort_stalled_resource(route: Route) -> None:
+        LOGGER.debug("Блокируем зависающий ресурс сайта: %s", route.request.url)
+        await route.abort()
+
+    for pattern in STALLED_RESOURCE_PATTERNS:
+        await page.route(pattern, abort_stalled_resource)
 
     try:
         await page.goto(
