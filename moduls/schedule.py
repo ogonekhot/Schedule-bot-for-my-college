@@ -199,11 +199,22 @@ async def _fetch_group(
     page = await context.new_page()
     timeout_ms = config.SCHEDULE_PAGE_TIMEOUT_SECONDS * 1000
     page.set_default_timeout(timeout_ms)
+    block_login_assets = True
+
+    async def block_initial_login_assets(route: Route) -> None:
+        if block_login_assets and route.request.resource_type != "document":
+            LOGGER.debug(
+                "Блокируем ресурс страницы входа: %s", route.request.url
+            )
+            await route.abort()
+            return
+        await route.continue_()
 
     async def abort_stalled_resource(route: Route) -> None:
         LOGGER.debug("Блокируем зависающий ресурс сайта: %s", route.request.url)
         await route.abort()
 
+    await page.route("**/*", block_initial_login_assets)
     for pattern in STALLED_RESOURCE_PATTERNS:
         await page.route(pattern, abort_stalled_resource)
 
@@ -215,6 +226,7 @@ async def _fetch_group(
         )
         login_field = page.locator('input[name="LOGIN"]')
         await login_field.wait_for(state="attached", timeout=timeout_ms)
+        block_login_assets = False
         await login_field.fill(credentials["login"])
         await page.locator('input[name="PASSWORD"]').fill(credentials["password"])
 
