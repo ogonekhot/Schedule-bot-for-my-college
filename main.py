@@ -1,178 +1,447 @@
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.filters import CommandObject, CommandStart
-from apscheduler.triggers.cron import CronTrigger
-from aiogram.types import InlineKeyboardButton
-from aiogram import types, Dispatcher, Bot, F
-import moduls.time as tm
-import moduls.db as dbm
-import logging
+from __future__ import annotations
+
 import asyncio
-import config
-import arrow
+import html
 import json
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
 
-#########################################################################################
-#                           Инициализация логирования и бота                            #
-#########################################################################################
+import arrow
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandStart
+from aiogram.types import InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-logging.basicConfig(level=logging.INFO)
+import config
+import moduls.db as dbm
+import moduls.schedule as schedule_source
+import moduls.time as tm
 
-bot = Bot(token=config.TOKEN)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+LOGGER = logging.getLogger(__name__)
+
 dp = Dispatcher()
+refresh_lock = asyncio.Lock()
 
-scheduler = AsyncIOScheduler()
+settings: dict[str, Any] = {}
+schedule: dict[str, Any] = {}
+addresses: dict[str, Any] = {}
+reference: dict[str, str] = {}
+last_update_error: str | None = None
 
-#########################################################################################
-#                       Загрузка настроек и дополнительных файлов                       #
-#########################################################################################
 
-try:
-    with open(rf"{config.BASE_DIR}/settings/global.json", "r", encoding="utf_8_sig") as f:
-        settings = json.loads(f.read())
-except BaseException as e:
-    raise f'Не удалось загрузить глобальные настройки: {e}'
-
-try:
-    with open(rf"{config.BASE_DIR}/settings/schedule.json", "r", encoding="utf_8_sig") as f:
-        schedule = json.loads(f.read())
-except BaseException as e:
-    raise f'Не удалось загрузить расписание: {e}'
-
-try:
-    with open(rf"{config.BASE_DIR}/settings/addresses.json", "r", encoding="utf_8_sig") as f:
-        adresses = json.loads(f.read())
-except BaseException as e:
-    raise f'Не удалось загрузить адреса: {e}'
-
-#########################################################################################
-#                                 Основная логика бота                                  #
-#########################################################################################
-
-async def check_registration(event):
-    user_data = await dbm.check_tg_id(event.from_user.id)
-
-    if user_data[1] is None:
-        buttons = InlineKeyboardBuilder()
-
-        if isinstance(event, types.Message):
-            message = event.answer
-        else:
-            message = event.message.edit_text
-
-        for i in schedule.keys():
-            buttons.row(InlineKeyboardButton(text = i, callback_data = f'settings_group_{i}'))
-
-        await message('Для начала выберите вашу группу:', reply_markup=buttons.as_markup())
-
-        return False
-    return True
-
-async def schedule_updater(user_id, date = arrow.now().format("DD.MM.YYYY")):
-    group = (await dbm.check_tg_id(user_id))[1]
-    day, color = await tm.get_this_weekday(settings["references"]["date"], settings["references"]["color"], date=date)
-    
-    text = f'<b>{day} - {color} ({arrow.get(date, "DD.MM.YYYY").format("DD.MM")})</b>\n\n'
-
+def _load_json(path: Path) -> Any:
     try:
-        schedule_fd = schedule[group][day]
-        count = 0
+        with path.open("r", encoding="utf-8-sig") as file:
+            return json.load(file)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Не удалось загрузить {path}: {exc}") from exc
 
-        for i in schedule_fd.keys():
-            if schedule_fd[i][color]["title"] != '' or schedule_fd[i][color]["teacher"] != '':
-                count += 1
-                text += f'{count}-я пара <b>{schedule_fd[i]["time"]["start"]} - {schedule_fd[i]["time"]["end"]}</b>:\n'
 
-                if schedule_fd[i][color]["title"] != '':
-                    text += f'{schedule_fd[i][color]["title"]}\n'
+def reload_runtime_data() -> None:
+    """Reload atomically written schedule files without restarting the bot."""
 
-                if schedule_fd[i][color]["teacher"] != '':
-                    text += f'{schedule_fd[i][color]["teacher"]}\n'
+    global settings, schedule, addresses, reference
+    settings = _load_json(config.GLOBAL_SETTINGS_FILE)
+    addresses = _load_json(config.ADDRESSES_FILE)
 
-                if schedule_fd[i][color]["room"] != '':
-                    for corpuse in adresses.keys():
-                        adress = None
-                        
-                        for flore in adresses[corpuse].keys():
-                            if str(schedule_fd[i][color]["room"]).isdigit():
-                                if int(adresses[corpuse][flore]["min"]) <= int(schedule_fd[i][color]["room"]) <= int(adresses[corpuse][flore]["max"]):
-                                    adress = f'{corpuse} {schedule_fd[i][color]["room"]} {schedule_fd[i][color]["type"]}'
-                            elif str(schedule_fd[i][color]["room"]).startswith('9-'):
-                                adress = f'9-й корпус {str(schedule_fd[i][color]["room"])[2:]} {schedule_fd[i][color]["type"]}'
-                            else:
-                                adress = f'{schedule_fd[i][color]["room"]} {schedule_fd[i][color]["type"]}'
+    schedule_path = (
+        config.SCHEDULE_FILE
+        if config.SCHEDULE_FILE.exists()
+        else config.INITIAL_SCHEDULE_FILE
+    )
+    schedule = _load_json(schedule_path)
+    reference = (
+        _load_json(config.REFERENCE_FILE)
+        if config.REFERENCE_FILE.exists()
+        else settings.get("references", {})
+    )
+    if not reference.get("date") or not reference.get("color"):
+        raise RuntimeError("Не заданы дата и цвет эталонной недели")
 
-                        if adress != None:
-                            break
-                        
-                    text += f'{adress}\n\n'
-    except:
-        text += 'Выходной'
 
-    return text
+def build_bot() -> Bot:
+    if not config.BOT_API_BASE_URL:
+        LOGGER.info("Используется официальный Telegram Bot API")
+        return Bot(token=config.TOKEN)
+
+    api = TelegramAPIServer.from_base(
+        config.BOT_API_BASE_URL,
+        is_local=config.BOT_API_IS_LOCAL,
+    )
+    session = AiohttpSession(api=api)
+    LOGGER.info("Используется локальный Telegram Bot API: %s", config.BOT_API_BASE_URL)
+    return Bot(token=config.TOKEN, session=session)
+
+
+def _available_groups() -> list[str]:
+    groups = list(schedule)
+    if groups:
+        return groups
+    return list(config.load_schedule_accounts(settings))
+
+
+def _is_admin(user_data: list, telegram_id: int) -> bool:
+    database_admin = len(user_data) > 2 and bool(user_data[2])
+    return database_admin or telegram_id in settings.get("admins", [])
+
+
+async def refresh_schedule() -> schedule_source.UpdateResult:
+    global last_update_error
+    async with refresh_lock:
+        try:
+            result = await schedule_source.update_schedule()
+            reload_runtime_data()
+            last_update_error = None
+            LOGGER.info("Расписание обновлено для групп: %s", ", ".join(result.groups))
+            return result
+        except Exception as exc:
+            last_update_error = str(exc)
+            LOGGER.exception("Автоматическое обновление расписания не удалось")
+            raise
+
+
+async def scheduled_refresh() -> None:
+    if refresh_lock.locked():
+        LOGGER.info("Предыдущее обновление ещё идёт, новый запуск пропущен")
+        return
+    try:
+        await refresh_schedule()
+    except Exception as exc:  # noqa: BLE001 - keep cached data on every update failure
+        # The cached schedule remains available; the next scheduled run retries.
+        LOGGER.debug("Плановое обновление завершилось ошибкой: %s", exc)
+
+
+async def check_registration(event: types.Message | types.CallbackQuery) -> bool:
+    user_data = await dbm.check_tg_id(event.from_user.id)
+    if len(user_data) > 1 and user_data[1] is not None:
+        return True
+
+    groups = _available_groups()
+    if isinstance(event, types.Message):
+        send = event.answer
+    else:
+        send = event.message.edit_text
+
+    if not groups:
+        await send(
+            "Расписание пока не загружено. Попробуйте ещё раз через несколько минут."
+        )
+        return False
+
+    buttons = InlineKeyboardBuilder()
+    for group in groups:
+        buttons.row(
+            InlineKeyboardButton(
+                text=group,
+                callback_data=f"settings_group_{group}",
+            )
+        )
+    await send("Для начала выберите вашу группу:", reply_markup=buttons.as_markup())
+    return False
+
+
+def _format_room(room: str, lesson_type: str) -> str:
+    room = str(room).strip()
+    lesson_type = str(lesson_type).strip()
+    if not room:
+        return ""
+
+    location = room
+    if room.isdigit():
+        room_number = int(room)
+        for corpus, floors in addresses.items():
+            if any(
+                int(floor["min"]) <= room_number <= int(floor["max"])
+                for floor in floors.values()
+            ):
+                location = f"{corpus} {room}"
+                break
+    elif room.startswith("9-"):
+        location = f"9-й корпус {room[2:]}"
+
+    return " ".join(part for part in (location, lesson_type) if part)
+
+
+async def render_schedule(
+    user_id: int,
+    date: str | None = None,
+) -> str:
+    date = date or arrow.now(config.BOT_TIMEZONE).format("DD.MM.YYYY")
+    group = (await dbm.check_tg_id(user_id))[1]
+    day, color = await tm.get_this_weekday(
+        reference["date"], reference["color"], date=date
+    )
+
+    shown_date = arrow.get(date, "DD.MM.YYYY").format("DD.MM")
+    lines = [f"<b>{html.escape(day)} — {html.escape(color)} ({shown_date})</b>", ""]
+    lessons = schedule.get(group, {}).get(day, {})
+    visible_count = 0
+
+    for lesson in lessons.values():
+        details = lesson.get(color, {})
+        if not any(details.get(field) for field in ("title", "teacher", "room")):
+            continue
+        visible_count += 1
+        lesson_time = lesson.get("time", {})
+        lines.append(
+            f"{visible_count}-я пара <b>"
+            f"{html.escape(str(lesson_time.get('start', '')))} — "
+            f"{html.escape(str(lesson_time.get('end', '')))}</b>:"
+        )
+        if details.get("title"):
+            lines.append(html.escape(str(details["title"])))
+        if details.get("teacher"):
+            lines.append(html.escape(str(details["teacher"])))
+        room = _format_room(details.get("room", ""), details.get("type", ""))
+        if room:
+            lines.append(html.escape(room))
+        lines.append("")
+
+    if visible_count == 0:
+        lines.append("Выходной")
+    return "\n".join(lines).rstrip()
+
 
 @dp.message(CommandStart())
-@dp.callback_query(F.data == 'back')
-async def start(event: types.Message | types.CallbackQuery):
+@dp.callback_query(F.data == "back")
+async def start(
+    event: types.Message | types.CallbackQuery,
+    callback_notice: str | None = None,
+) -> None:
     user_data = await dbm.check_tg_id(event.from_user.id)
+    if not await check_registration(event):
+        return
 
+    buttons = InlineKeyboardBuilder()
+    buttons.row(InlineKeyboardButton(text="Расписание", callback_data="schedule"))
+    if _is_admin(user_data, event.from_user.id):
+        buttons.row(InlineKeyboardButton(text="Админ-панель", callback_data="admin"))
+
+    text = f"С возвращением, {html.escape(event.from_user.full_name)}!"
     if isinstance(event, types.Message):
-        message = event.answer
+        await event.answer(text, reply_markup=buttons.as_markup(), parse_mode="HTML")
     else:
-        message = event.message.edit_text
+        await event.message.edit_text(
+            text, reply_markup=buttons.as_markup(), parse_mode="HTML"
+        )
+        await event.answer(callback_notice)
+
+
+@dp.callback_query(F.data.startswith("schedule"))
+async def schedule_manager(callback: types.CallbackQuery) -> None:
+    if not await check_registration(callback):
+        await callback.answer()
+        return
+
+    parts = callback.data.split("_", maxsplit=1)
+    date = (
+        parts[1]
+        if len(parts) == 2
+        else arrow.now(config.BOT_TIMEZONE).format("DD.MM.YYYY")
+    )
+    try:
+        text = await render_schedule(callback.from_user.id, date)
+        previous_week, previous_day, next_day, next_week = await asyncio.gather(
+            tm.get_next_previous(date, "extra_previous"),
+            tm.get_next_previous(date, "previous"),
+            tm.get_next_previous(date, "next"),
+            tm.get_next_previous(date, "extra_next"),
+        )
+    except ValueError:
+        await callback.answer("Некорректная дата", show_alert=True)
+        return
 
     buttons = InlineKeyboardBuilder()
+    buttons.row(
+        InlineKeyboardButton(text="⏪", callback_data=f"schedule_{previous_week}"),
+        InlineKeyboardButton(text="◀️", callback_data=f"schedule_{previous_day}"),
+        InlineKeyboardButton(text="🔄", callback_data="schedule"),
+        InlineKeyboardButton(text="▶️", callback_data=f"schedule_{next_day}"),
+        InlineKeyboardButton(text="⏩", callback_data=f"schedule_{next_week}"),
+    )
+    buttons.row(InlineKeyboardButton(text="Назад", callback_data="back"))
 
-    if await check_registration(event) == True:
-        buttons.row(InlineKeyboardButton(text = 'Расписание', callback_data = 'schedule'))
-        if user_data[2] == 1:
-            buttons.row(InlineKeyboardButton(text = 'Админ панель', callback_data = 'admin'))
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=buttons.as_markup(),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).casefold():
+            await callback.answer("Ничего не изменилось")
+        else:
+            raise
 
-        await message(f'С возвращением, {event.from_user.full_name}!', reply_markup=buttons.as_markup())
 
-@dp.callback_query(str(F.data).startswith('schedule'))
-async def schedule_manager(callback: types.CallbackQuery):
-    if await check_registration(callback) == True:
-        temp = callback.data.split('_')
+@dp.callback_query(F.data.startswith("settings_group_"))
+async def settings_manager(callback: types.CallbackQuery) -> None:
+    group = callback.data.removeprefix("settings_group_")
+    if group not in _available_groups():
+        await callback.answer("Такой группы больше нет", show_alert=True)
+        return
+    user_id = (await dbm.check_tg_id(callback.from_user.id))[0]
+    message = await dbm.update_user_settings(user_id, "group_name", group)
+    await start(callback, callback_notice=message)
 
-        if len(temp) == 1:
-            temp.append(arrow.now().format("DD.MM.YYYY"))
 
-        buttons = InlineKeyboardBuilder()
-        buttons.row(InlineKeyboardButton(text = '⏪', callback_data = f'schedule_{await tm.get_next_previous(temp[1], "e_p")}'), InlineKeyboardButton(text = '◀️', callback_data = f'schedule_{await tm.get_next_previous(temp[1], "p")}'), InlineKeyboardButton(text = '🔄️', callback_data = 'schedule'), InlineKeyboardButton(text = '▶️', callback_data = f'schedule_{await tm.get_next_previous(temp[1], "n")}'), InlineKeyboardButton(text = '⏩', callback_data = f'schedule_{await tm.get_next_previous(temp[1], "e_n")}'))
-        buttons.row(InlineKeyboardButton(text = 'Назад', callback_data = 'back'))
-        
-        text = await schedule_updater(callback.from_user.id, temp[1])
-
+def _update_status_text() -> str:
+    if refresh_lock.locked():
+        return "Обновление расписания: выполняется"
+    if last_update_error:
+        return f"Последняя ошибка обновления: {last_update_error}"
+    updated_at = reference.get("updated_at")
+    if updated_at:
         try:
-            await callback.message.edit_text(text, reply_markup=buttons.as_markup(), parse_mode='HTML')
-        except:
-            await callback.answer('Ничего не изменилось...', show_alert=False)
+            value = datetime.fromisoformat(updated_at).astimezone(
+                ZoneInfo(config.BOT_TIMEZONE)
+            )
+            return f"Расписание обновлено: {value:%d.%m.%Y %H:%M}"
+        except ValueError:
+            pass
+    return "Используется расписание из начального файла"
 
-@dp.callback_query(str(F.data).startswith('settings'))
-async def settings_manager(callback: types.CallbackQuery):
-    temp = callback.data.split('_')
-    
-    if temp[1] == 'group':
-        await callback.answer(await dbm.update_user_settings((await dbm.check_tg_id(callback.from_user.id))[0], 'group_name', temp[2]), show_alert=False)
 
-    await start(callback)
-
-@dp.callback_query(str(F.data).startswith('admin'))
-async def profile_manager(callback: types.CallbackQuery):
-    buttons = InlineKeyboardBuilder()
-    buttons.row(InlineKeyboardButton(text = 'Назад', callback_data = 'back'))
-
+async def show_admin_panel(callback: types.CallbackQuery) -> bool:
     user_data = await dbm.check_tg_id(callback.from_user.id)
+    if not _is_admin(user_data, callback.from_user.id):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return False
 
-    await callback.message.edit_text(f'Профиль:\nИмя: {callback.from_user.full_name}\nСсылка: tg://user?id={callback.from_user.id}\nTelegram_ID: {callback.from_user.id}\nDB_ID: {user_data[0]}\nГруппа: {user_data[1]}\nDebug режим: {'true' if user_data[2] == 1 else 'false'}', reply_markup=buttons.as_markup())
+    buttons = InlineKeyboardBuilder()
+    buttons.row(
+        InlineKeyboardButton(
+            text="🔄 Обновить расписание", callback_data="admin_update"
+        )
+    )
+    buttons.row(InlineKeyboardButton(text="Назад", callback_data="back"))
+    admin_value = "true" if _is_admin(user_data, callback.from_user.id) else "false"
+    text = (
+        "Профиль:\n"
+        f"Имя: {html.escape(callback.from_user.full_name)}\n"
+        f"Ссылка: tg://user?id={callback.from_user.id}\n"
+        f"Telegram ID: {callback.from_user.id}\n"
+        f"DB ID: {user_data[0]}\n"
+        f"Группа: {html.escape(str(user_data[1]))}\n"
+        f"Администратор: {admin_value}\n\n"
+        f"{html.escape(_update_status_text())}"
+    )
+    await callback.message.edit_text(
+        text, reply_markup=buttons.as_markup(), parse_mode="HTML"
+    )
+    return True
+
+
+@dp.callback_query(F.data == "admin_update")
+async def force_update_callback(callback: types.CallbackQuery) -> None:
+    user_data = await dbm.check_tg_id(callback.from_user.id)
+    if not _is_admin(user_data, callback.from_user.id):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+    if refresh_lock.locked():
+        await callback.answer("Обновление уже выполняется", show_alert=True)
+        return
+
+    await callback.answer("Обновляю расписание…")
+    await callback.message.edit_text("Получаю свежее расписание с сайта колледжа…")
+    try:
+        await refresh_schedule()
+        await show_admin_panel(callback)
+    except Exception as exc:  # noqa: BLE001 - show any updater failure to the admin
+        buttons = InlineKeyboardBuilder()
+        buttons.row(InlineKeyboardButton(text="Назад", callback_data="admin"))
+        await callback.message.edit_text(
+            "Не удалось обновить расписание. Старое расписание сохранено.\n\n"
+            f"Ошибка: {html.escape(str(exc))}",
+            reply_markup=buttons.as_markup(),
+            parse_mode="HTML",
+        )
+
+
+@dp.callback_query(F.data == "admin")
+async def admin_panel(callback: types.CallbackQuery) -> None:
+    if await show_admin_panel(callback):
+        await callback.answer()
+
+
+@dp.message(Command("update"))
+async def force_update_command(message: types.Message) -> None:
+    user_data = await dbm.check_tg_id(message.from_user.id)
+    if not _is_admin(user_data, message.from_user.id):
+        await message.answer("Недостаточно прав")
+        return
+    if refresh_lock.locked():
+        await message.answer("Обновление уже выполняется")
+        return
+
+    status = await message.answer("Получаю свежее расписание с сайта колледжа…")
+    try:
+        result = await refresh_schedule()
+        await status.edit_text(
+            "Расписание обновлено для групп: " + ", ".join(result.groups)
+        )
+    except Exception as exc:  # noqa: BLE001 - show any updater failure to the admin
+        await status.edit_text(
+            "Не удалось обновить расписание. Старое расписание сохранено.\n\n"
+            f"Ошибка: {html.escape(str(exc))}",
+            parse_mode="HTML",
+        )
+
 
 @dp.message()
-async def dell_user_massage(message: types.Message):
-    await message.delete()
+async def delete_user_message(message: types.Message) -> None:
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
 
-async def main():
-    await dp.start_polling(bot)
+
+async def main() -> None:
+    config.validate_runtime_config()
+    reload_runtime_data()
+    bot = build_bot()
+    scheduler = AsyncIOScheduler(timezone=config.BOT_TIMEZONE)
+    scheduler.add_job(
+        scheduled_refresh,
+        "interval",
+        minutes=config.SCHEDULE_UPDATE_INTERVAL_MINUTES,
+        id="schedule-refresh",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+    scheduler.start()
+
+    startup_task: asyncio.Task | None = None
+    if config.SCHEDULE_UPDATE_ON_STARTUP:
+        startup_task = asyncio.create_task(scheduled_refresh(), name="startup-refresh")
+
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+        await dp.start_polling(
+            bot,
+            close_bot_session=False,
+            allowed_updates=dp.resolve_used_update_types(),
+        )
+    finally:
+        scheduler.shutdown(wait=False)
+        if startup_task and not startup_task.done():
+            startup_task.cancel()
+            await asyncio.gather(startup_task, return_exceptions=True)
+        await bot.session.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

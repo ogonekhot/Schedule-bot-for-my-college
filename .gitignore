@@ -1,4 +1,7 @@
-moduls/db.py
-moduls/__pycache__
-moduls/schedule/__pycache__/
-__pycache__
+.env
+.venv/
+data/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
