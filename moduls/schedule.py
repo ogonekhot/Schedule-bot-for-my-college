@@ -161,7 +161,7 @@ async def _wait_for_schedule_response(page: Page) -> str:
     try:
         await page.goto(
             config.COLLEGE_SCHEDULE_URL,
-            wait_until="domcontentloaded",
+            wait_until="commit",
             timeout=timeout_ms,
         )
         try:
@@ -173,7 +173,7 @@ async def _wait_for_schedule_response(page: Page) -> str:
             LOGGER.info(
                 "AJAX-ответ не пришёл после перехода, пробуем обновить страницу"
             )
-            await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+            await page.reload(wait_until="commit", timeout=timeout_ms)
             return await asyncio.wait_for(
                 asyncio.shield(response_future),
                 timeout=config.SCHEDULE_PAGE_TIMEOUT_SECONDS,
@@ -210,16 +210,16 @@ async def _fetch_group(
     try:
         await page.goto(
             config.COLLEGE_LOGIN_URL,
-            wait_until="domcontentloaded",
+            wait_until="commit",
             timeout=timeout_ms,
         )
-        await page.locator('input[name="LOGIN"]').fill(credentials["login"])
+        login_field = page.locator('input[name="LOGIN"]')
+        await login_field.wait_for(state="attached", timeout=timeout_ms)
+        await login_field.fill(credentials["login"])
         await page.locator('input[name="PASSWORD"]').fill(credentials["password"])
-        await page.locator('button[type="submit"]').click()
-        try:
-            await page.wait_for_load_state("networkidle", timeout=timeout_ms)
-        except PlaywrightTimeoutError:
-            LOGGER.debug("После входа networkidle не наступил, продолжаем")
+
+        async with page.expect_navigation(wait_until="commit", timeout=timeout_ms):
+            await page.locator("#auth_form").evaluate("(form) => form.submit()")
 
         login_field = page.locator('input[name="LOGIN"]')
         if await login_field.count() and await login_field.first.is_visible():
