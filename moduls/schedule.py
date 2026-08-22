@@ -1,126 +1,318 @@
-from playwright.async_api import async_playwright
-from bs4 import BeautifulSoup
+"""Download, parse and atomically persist the college schedule."""
+
+from __future__ import annotations
+
 import asyncio
-import bleach
 import json
-import arrow
+import logging
+import os
+import re
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from bs4 import BeautifulSoup, Tag
+from playwright.async_api import (
+    Browser,
+    Page,
+    Response,
+    async_playwright,
+)
+from playwright.async_api import (
+    TimeoutError as PlaywrightTimeoutError,
+)
+
 import config
 
-white = 'Белая неделя'
-green = 'Зелёная неделя'
+LOGGER = logging.getLogger(__name__)
 
-async def update_schedule():
-    schedule = {}
+WHITE_WEEK = "Белая неделя"
+GREEN_WEEK = "Зелёная неделя"
+WEEKDAYS = {"ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"}
+TIME_RE = re.compile(r"^(\d{1,2}:\d{2})\s*[-–—]\s*(\d{1,2}:\d{2})$")
+LESSON_TYPES = {
+    "пр.": "практика",
+    "практ.": "практика",
+    "лек.": "лекция",
+    "лаб.": "лабораторная",
+}
 
-    with open(rf"{config.BASE_DIR}/settings/global.json", "r", encoding="utf_8_sig") as f:
-        settings = json.loads(f.read())
 
-    for i in settings['accounts'].keys():
-        group = str(i)
-        schedule[group] = {}
-        login = settings['accounts'][group]['login']
-        password = settings['accounts'][group]['password']
+class ScheduleUpdateError(RuntimeError):
+    """Raised when a complete, safe schedule update cannot be produced."""
 
-        async with async_playwright() as p:
-            browser = await p.firefox.launch(headless=False)
-            page = await browser.new_page()
 
-            await page.goto("http://lk.stu.lipetsk.ru/", wait_until="domcontentloaded")
-            await asyncio.sleep(2)
-            await page.wait_for_load_state("networkidle")
+@dataclass(frozen=True)
+class UpdateResult:
+    groups: tuple[str, ...]
+    reference_date: str
+    reference_color: str
+    updated_at: str
 
-            await page.fill('input[name="LOGIN"]', login)
-            await page.fill('input[name="PASSWORD"]', password)
-            
-            await page.click('button[type="submit"]')
 
-            await page.wait_for_load_state("domcontentloaded")
-            await asyncio.sleep(2)
-            await page.wait_for_load_state("networkidle")
+def _empty_lesson(start: str, end: str) -> dict[str, Any]:
+    empty = {"title": "", "teacher": "", "room": "", "type": ""}
+    return {
+        "time": {"start": start, "end": end},
+        WHITE_WEEK: empty.copy(),
+        GREEN_WEEK: empty.copy(),
+    }
 
-            while True:
-                try:
-                    await page.goto("http://lk.stu.lipetsk.ru/education/0/5:136841076/", wait_until="domcontentloaded")
-                    await asyncio.sleep(2)
-                    await page.wait_for_load_state("networkidle")
-                    
-                    col = 0
-                    ajax_response = ''
 
-                    async def handle_response(response):
-                        nonlocal ajax_response
-                        nonlocal col
-                        if "ajax.handler.php" in response.url:
-                            col += 1
-                            if col == 1:
-                                try:
-                                    body = await response.body()
-                                    ajax_response = body.decode('cp1251')
-                                except Exception as e:
-                                    print(f"Ошибка при получении данных: {e}")
+def _clean_lines(cell: Tag) -> list[str]:
+    return [
+        re.sub(r"\s+", " ", line).strip()
+        for line in cell.get_text("\n", strip=True).splitlines()
+        if line.strip()
+    ]
 
-                    page.on("response", handle_response)
 
-                    await page.reload()
-                    await asyncio.sleep(2)
-                    await page.wait_for_load_state("networkidle")
+def parse_schedule_html(html: str) -> dict[str, dict[str, Any]]:
+    """Convert the AJAX schedule table into the bot's JSON structure."""
 
-                    weak_color = await page.query_selector('div[role=alert]')
-                    weak_color = await weak_color.text_content()
+    soup = BeautifulSoup(html, "html.parser")
+    table_body = soup.find("tbody")
+    if table_body is None:
+        raise ScheduleUpdateError("в ответе сайта не найдена таблица расписания")
 
-                    await browser.close()
+    result: dict[str, dict[str, Any]] = {}
+    current_day: str | None = None
+    current_lesson: str | None = None
 
-                    soup = BeautifulSoup(ajax_response, 'html.parser')
-                    s = soup.find('tbody')
-                    count = 0
+    for cell in table_body.select("td"):
+        lines = _clean_lines(cell)
+        if not lines:
+            continue
 
-                    for i in s.select('td'):
-                        clean = bleach.clean(str(i), tags=[], strip=True).strip()
-                        
-                        if clean != '':
-                            if len(clean) == 2:
-                                schedule[group][clean] = {}
-                                count = 0
-                            elif ' - ' in clean:
-                                time = clean.split(' - ')
-                                count += 1
-                                schedule[group][list(schedule[group].keys())[-1]][str(count)] = {'time': {'start': time[0], 'end': time[1]}, white: {'title': '', 'teacher': '', 'room': '', 'type': ''}, green: {'title': '', 'teacher': '', 'room': '', 'type': ''}}
-                            else:
-                                if 'bgGreen' not in i.get('class'):
-                                    tmp = schedule[group][list(schedule[group].keys())[-1]][str(count)][white]
-                                elif 'bgGreen' in i.get('class'):
-                                    tmp = schedule[group][list(schedule[group].keys())[-1]][str(count)][green]
+        joined = " ".join(lines).strip()
+        weekday = joined.upper()
+        if weekday in WEEKDAYS:
+            current_day = weekday
+            result.setdefault(current_day, {})
+            current_lesson = None
+            continue
 
-                                if len(str(i).split('<br/>')) == 2:
-                                    tmp['room'] = bleach.clean(str(i).split('<br/>')[0], tags=[], strip=True).strip()
+        time_match = TIME_RE.fullmatch(joined)
+        if time_match:
+            if current_day is None:
+                continue
+            current_lesson = str(len(result[current_day]) + 1)
+            result[current_day][current_lesson] = _empty_lesson(*time_match.groups())
+            continue
 
-                                    stype = bleach.clean(str(i).split('<br/>')[1], tags=[], strip=True).strip()
+        if current_day is None or current_lesson is None:
+            continue
 
-                                    if stype == "пр.":
-                                        stype = 'практика'
-                                    elif stype == "лек.":
-                                        stype = 'лекция'
-                                    elif stype == "лаб.":
-                                        stype = 'лаборатоная'
+        classes = set(cell.get("class", []))
+        color = GREEN_WEEK if "bgGreen" in classes else WHITE_WEEK
+        lesson = result[current_day][current_lesson][color]
 
-                                    tmp['type'] = stype
-                                elif len(str(i).split('<br/>')) == 3:
-                                    tmp['title'] = bleach.clean(str(i).split('<br/>')[0], tags=[], strip=True).strip().capitalize()
-                                    tmp['teacher'] = bleach.clean(str(i).split('<br/>')[2], tags=[], strip=True).strip()
-                                else:
-                                    tmp['title'] = bleach.clean(str(i), tags=[], strip=True).strip().capitalize()
-                    break
-                except Exception as e:
-                    print(f"Ошибка при получении расписания для группы {group}: {e}")
-            
+        lesson_type = LESSON_TYPES.get(lines[-1].casefold())
+        if len(lines) == 2 and lesson_type:
+            lesson["room"] = lines[0]
+            lesson["type"] = lesson_type
+        elif len(lines) >= 3:
+            lesson["title"] = lines[0]
+            lesson["teacher"] = lines[-1]
+        elif len(lines) == 2:
+            lesson["title"] = lines[0]
+            lesson["teacher"] = lines[1]
+        else:
+            lesson["title"] = lines[0]
+
+    lesson_count = sum(len(day) for day in result.values())
+    if not result or lesson_count == 0:
+        raise ScheduleUpdateError("сайт вернул пустое расписание")
+    return result
+
+
+def _decode_body(body: bytes) -> str:
+    for encoding in ("utf-8", "cp1251"):
+        try:
+            return body.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return body.decode("cp1251", errors="replace")
+
+
+async def _wait_for_schedule_response(page: Page) -> str:
+    loop = asyncio.get_running_loop()
+    response_future: asyncio.Future[str] = loop.create_future()
+
+    async def capture(response: Response) -> None:
+        if "ajax.handler.php" not in response.url or response_future.done():
+            return
+        try:
+            text = _decode_body(await response.body())
+            if "<td" in text.casefold() or "<tbody" in text.casefold():
+                response_future.set_result(text)
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover
+            LOGGER.debug("Не удалось прочитать AJAX-ответ %s: %s", response.url, exc)
+
+    page.on("response", capture)
+    timeout_ms = config.SCHEDULE_PAGE_TIMEOUT_SECONDS * 1000
+    try:
+        await page.goto(
+            config.COLLEGE_SCHEDULE_URL,
+            wait_until="domcontentloaded",
+            timeout=timeout_ms,
+        )
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(response_future),
+                timeout=config.SCHEDULE_PAGE_TIMEOUT_SECONDS,
+            )
+        except (TimeoutError, PlaywrightTimeoutError):
+            LOGGER.info(
+                "AJAX-ответ не пришёл после перехода, пробуем обновить страницу"
+            )
+            await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+            return await asyncio.wait_for(
+                asyncio.shield(response_future),
+                timeout=config.SCHEDULE_PAGE_TIMEOUT_SECONDS,
+            )
+    finally:
+        page.remove_listener("response", capture)
+
+
+async def _read_week_color(page: Page) -> str | None:
+    for text in await page.locator("div[role=alert]").all_text_contents():
+        normalized = text.casefold().replace("ё", "е")
+        if "белая" in normalized:
+            return WHITE_WEEK
+        if "зеленая" in normalized:
+            return GREEN_WEEK
+    return None
+
+
+async def _fetch_group(
+    browser: Browser, group: str, credentials: dict[str, str]
+) -> tuple[dict[str, dict[str, Any]], str | None]:
+    context = await browser.new_context(ignore_https_errors=True)
+    page = await context.new_page()
+    timeout_ms = config.SCHEDULE_PAGE_TIMEOUT_SECONDS * 1000
+    page.set_default_timeout(timeout_ms)
+
+    try:
+        await page.goto(
+            config.COLLEGE_LOGIN_URL,
+            wait_until="domcontentloaded",
+            timeout=timeout_ms,
+        )
+        await page.locator('input[name="LOGIN"]').fill(credentials["login"])
+        await page.locator('input[name="PASSWORD"]').fill(credentials["password"])
+        await page.locator('button[type="submit"]').click()
+        try:
+            await page.wait_for_load_state("networkidle", timeout=timeout_ms)
+        except PlaywrightTimeoutError:
+            LOGGER.debug("После входа networkidle не наступил, продолжаем")
+
+        login_field = page.locator('input[name="LOGIN"]')
+        if await login_field.count() and await login_field.first.is_visible():
+            raise ScheduleUpdateError(
+                f"группа {group}: сайт не принял логин или пароль"
+            )
+
+        ajax_html = await _wait_for_schedule_response(page)
+        week_color = await _read_week_color(page)
+        return parse_schedule_html(ajax_html), week_color
+    finally:
+        await context.close()
+
+
+async def _fetch_group_with_retries(
+    browser: Browser, group: str, credentials: dict[str, str]
+) -> tuple[dict[str, dict[str, Any]], str | None]:
+    last_error: Exception | None = None
+    for attempt in range(1, config.SCHEDULE_UPDATE_MAX_ATTEMPTS + 1):
+        try:
+            return await _fetch_group(browser, group, credentials)
+        except Exception as exc:  # noqa: BLE001 - retries cover all browser failures
+            last_error = exc
+            LOGGER.warning(
+                "Попытка %s/%s для группы %s не удалась: %s",
+                attempt,
+                config.SCHEDULE_UPDATE_MAX_ATTEMPTS,
+                group,
+                exc,
+            )
+            if attempt < config.SCHEDULE_UPDATE_MAX_ATTEMPTS:
+                await asyncio.sleep(config.SCHEDULE_UPDATE_RETRY_SECONDS * attempt)
+    raise ScheduleUpdateError(f"не удалось обновить группу {group}: {last_error}")
+
+
+def _atomic_json_dump(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            json.dump(value, file, ensure_ascii=False, indent=4)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _load_global_settings() -> dict[str, Any]:
+    with config.GLOBAL_SETTINGS_FILE.open("r", encoding="utf-8-sig") as file:
+        return json.load(file)
+
+
+async def update_schedule() -> UpdateResult:
+    """Fetch every configured group and replace cache only after full success."""
+
+    settings = _load_global_settings()
+    accounts = config.load_schedule_accounts(settings)
+    if not accounts:
+        raise ScheduleUpdateError(
+            "не заданы аккаунты колледжа: заполните SCHEDULE_ACCOUNTS_JSON"
+        )
+
+    new_schedule: dict[str, dict[str, Any]] = {}
+    detected_colors: list[str] = []
+
+    async with async_playwright() as playwright:
+        browser_type = getattr(playwright, config.SCHEDULE_BROWSER)
+        browser = await browser_type.launch(headless=config.SCHEDULE_HEADLESS)
+        try:
+            for group, credentials in accounts.items():
+                group_schedule, color = await _fetch_group_with_retries(
+                    browser, group, credentials
+                )
+                new_schedule[group] = group_schedule
+                if color:
+                    detected_colors.append(color)
+        finally:
             await browser.close()
 
-    with open(rf"{config.BASE_DIR}/settings/schedule.json", 'w', encoding='utf-8') as f:
-        json.dump(schedule, f, ensure_ascii=False, indent=4)
+    fallback_color = settings.get("references", {}).get("color", WHITE_WEEK)
+    reference_color = detected_colors[0] if detected_colors else fallback_color
+    if any(color != reference_color for color in detected_colors):
+        LOGGER.warning("Страница показала разные цвета недели для разных аккаунтов")
 
-    settings['references']['date'] = arrow.now().format('DD.MM.YYYY')
-    settings['references']['color'] = white if 'белая' in weak_color else green
+    now = datetime.now(ZoneInfo(config.BOT_TIMEZONE))
+    state = {
+        "date": now.strftime("%d.%m.%Y"),
+        "color": reference_color,
+        "updated_at": now.isoformat(timespec="seconds"),
+    }
 
-    with open(rf"{config.BASE_DIR}/settings/global.json", 'w', encoding='utf-8') as f:
-        json.dump(settings, f, ensure_ascii=False, indent=4)
-
+    _atomic_json_dump(config.SCHEDULE_FILE, new_schedule)
+    _atomic_json_dump(config.REFERENCE_FILE, state)
+    return UpdateResult(
+        groups=tuple(new_schedule),
+        reference_date=state["date"],
+        reference_color=state["color"],
+        updated_at=state["updated_at"],
+    )
