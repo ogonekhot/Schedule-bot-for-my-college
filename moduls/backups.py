@@ -99,6 +99,10 @@ def _payload_to_info(path: Path, payload: Any) -> ScheduleBackupInfo:
     reference = payload.get("reference")
     if not isinstance(schedule, dict) or not isinstance(reference, dict):
         raise ScheduleBackupError(f"копия {path.name} повреждена")
+    if not reference.get("date") or not reference.get("color"):
+        raise ScheduleBackupError(
+            f"в копии {path.name} отсутствует эталон недели"
+        )
     backup_id = path.stem.removeprefix("schedule-")
     if not BACKUP_ID_RE.fullmatch(backup_id):
         raise ScheduleBackupError(f"некорректное имя копии {path.name}")
