@@ -341,6 +341,12 @@ async def show_admin_panel(callback: types.CallbackQuery) -> bool:
             callback_data="admin_broadcast",
         )
     )
+    buttons.row(
+        InlineKeyboardButton(
+            text="👥 Оповещение группе",
+            callback_data="admin_group_broadcast",
+        )
+    )
     buttons.row(InlineKeyboardButton(text="Назад", callback_data="back"))
     admin_value = "true" if _is_admin(user_data, callback.from_user.id) else "false"
     text = (
@@ -399,6 +405,7 @@ async def begin_global_broadcast(
         return
 
     await state.clear()
+    await state.update_data(target_group=None)
     await state.set_state(BroadcastFlow.waiting_for_message)
 
     buttons = InlineKeyboardBuilder()
@@ -410,6 +417,95 @@ async def begin_global_broadcast(
     )
     await callback.message.edit_text(
         "Отправьте сообщение для глобального оповещения.\n\n"
+        "Поддерживаются текст, фото, видео, документы и другие "
+        "обычные сообщения Telegram. Перед рассылкой бот попросит подтверждение.",
+        reply_markup=buttons.as_markup(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_group_broadcast")
+async def choose_broadcast_group(
+    callback: types.CallbackQuery,
+    state: FSMContext,
+) -> None:
+    user_data = await dbm.check_tg_id(callback.from_user.id)
+    if not _is_admin(user_data, callback.from_user.id):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+    if broadcast_lock.locked():
+        await callback.answer("Другая рассылка уже выполняется", show_alert=True)
+        return
+
+    groups = _available_groups()
+    if not groups:
+        await callback.answer("Список групп пока пуст", show_alert=True)
+        return
+
+    await state.clear()
+    buttons = InlineKeyboardBuilder()
+    for index, group in enumerate(groups):
+        buttons.row(
+            InlineKeyboardButton(
+                text=group,
+                callback_data=f"admin_broadcast_group_{index}",
+            )
+        )
+    buttons.row(
+        InlineKeyboardButton(
+            text="Отмена",
+            callback_data="admin_broadcast_cancel",
+        )
+    )
+    await callback.message.edit_text(
+        "Выберите группу, которой нужно отправить оповещение:",
+        reply_markup=buttons.as_markup(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_broadcast_group_"))
+async def begin_group_broadcast(
+    callback: types.CallbackQuery,
+    state: FSMContext,
+) -> None:
+    user_data = await dbm.check_tg_id(callback.from_user.id)
+    if not _is_admin(user_data, callback.from_user.id):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+    if broadcast_lock.locked():
+        await callback.answer("Другая рассылка уже выполняется", show_alert=True)
+        return
+
+    try:
+        group_index = int(callback.data.removeprefix("admin_broadcast_group_"))
+        group = _available_groups()[group_index]
+    except (ValueError, IndexError):
+        await callback.answer("Такая группа больше недоступна", show_alert=True)
+        return
+
+    recipients = await dbm.get_telegram_ids_by_group(group)
+    if not recipients:
+        await callback.answer(
+            "В этой группе пока нет зарегистрированных пользователей",
+            show_alert=True,
+        )
+        return
+
+    await state.clear()
+    await state.update_data(target_group=group)
+    await state.set_state(BroadcastFlow.waiting_for_message)
+
+    buttons = InlineKeyboardBuilder()
+    buttons.row(
+        InlineKeyboardButton(
+            text="Отмена",
+            callback_data="admin_broadcast_cancel",
+        )
+    )
+    await callback.message.edit_text(
+        f"Отправьте оповещение для группы «{group}».\n\n"
+        f"Сейчас в группе получателей: {len(set(recipients))}. "
         "Поддерживаются текст, фото, видео, документы и другие "
         "обычные сообщения Telegram. Перед рассылкой бот попросит подтверждение.",
         reply_markup=buttons.as_markup(),
@@ -444,11 +540,21 @@ async def prepare_global_broadcast(
         await message.answer("Недостаточно прав")
         return
 
-    recipients = await dbm.get_all_telegram_ids()
+    data = await state.get_data()
+    target_group = data.get("target_group")
+    if target_group:
+        recipients = await dbm.get_telegram_ids_by_group(str(target_group))
+        target_text = f"группе «{target_group}»"
+        confirm_text = f"✅ Отправить группе ({len(set(recipients))})"
+    else:
+        recipients = await dbm.get_all_telegram_ids()
+        target_text = "всем зарегистрированным пользователям"
+        confirm_text = f"✅ Отправить всем ({len(set(recipients))})"
+
     recipient_count = len(set(recipients))
     if recipient_count == 0:
         await state.clear()
-        await message.answer("В базе пока нет пользователей для рассылки")
+        await message.answer("Для выбранной рассылки пока нет получателей")
         return
 
     await state.update_data(
@@ -460,7 +566,7 @@ async def prepare_global_broadcast(
     buttons = InlineKeyboardBuilder()
     buttons.row(
         InlineKeyboardButton(
-            text=f"✅ Отправить всем ({recipient_count})",
+            text=confirm_text,
             callback_data="admin_broadcast_confirm",
         )
     )
@@ -471,7 +577,7 @@ async def prepare_global_broadcast(
         )
     )
     await message.answer(
-        "Сообщение принято. Отправить его всем зарегистрированным пользователям?",
+        f"Сообщение принято. Отправить его {target_text}?",
         reply_markup=buttons.as_markup(),
     )
 
@@ -496,18 +602,42 @@ async def confirm_global_broadcast(
     data = await state.get_data()
     source_chat_id = data.get("source_chat_id")
     source_message_id = data.get("source_message_id")
+    target_group = data.get("target_group")
     if source_chat_id is None or source_message_id is None:
         await state.clear()
         await callback.answer("Сообщение для рассылки потеряно", show_alert=True)
         return
 
     async with broadcast_lock:
+        if target_group:
+            recipients = await dbm.get_telegram_ids_by_group(str(target_group))
+            progress_text = (
+                f"Отправляю оповещение группе «{target_group}»: "
+                f"{len(set(recipients))}…"
+            )
+            completed_text = f"Оповещение группе «{target_group}» отправлено."
+        else:
+            recipients = await dbm.get_all_telegram_ids()
+            progress_text = (
+                "Отправляю глобальное оповещение пользователям: "
+                f"{len(set(recipients))}…"
+            )
+            completed_text = "Глобальное оповещение отправлено."
+
         await state.clear()
-        recipients = await dbm.get_all_telegram_ids()
+        if not recipients:
+            await callback.answer("Получателей больше нет", show_alert=True)
+            buttons = InlineKeyboardBuilder()
+            buttons.row(InlineKeyboardButton(text="Назад", callback_data="admin"))
+            await callback.message.edit_text(
+                "Рассылка не выполнена: для выбранной аудитории больше нет "
+                "зарегистрированных пользователей.",
+                reply_markup=buttons.as_markup(),
+            )
+            return
+
         await callback.answer("Рассылка началась")
-        await callback.message.edit_text(
-            f"Отправляю оповещение пользователям: {len(set(recipients))}…"
-        )
+        await callback.message.edit_text(progress_text)
 
         result = await broadcast_service.copy_message_to_users(
             callback.bot,
@@ -519,7 +649,7 @@ async def confirm_global_broadcast(
     buttons = InlineKeyboardBuilder()
     buttons.row(InlineKeyboardButton(text="Назад", callback_data="admin"))
     await callback.message.edit_text(
-        "Глобальное оповещение отправлено.\n\n"
+        f"{completed_text}\n\n"
         f"Всего получателей: {result.total}\n"
         f"✅ Доставлено: {result.delivered}\n"
         f"🚫 Бот заблокирован: {result.blocked}\n"
