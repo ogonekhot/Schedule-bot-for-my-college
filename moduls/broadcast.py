@@ -24,6 +24,7 @@ class BroadcastResult:
     delivered: int
     blocked: int
     failed: int
+    blocked_recipients: tuple[int, ...]
 
 
 async def copy_message_to_users(
@@ -40,6 +41,7 @@ async def copy_message_to_users(
     delivered = 0
     blocked = 0
     failed = 0
+    blocked_recipients: list[int] = []
 
     for chat_id in unique_recipients:
         while True:
@@ -55,11 +57,12 @@ async def copy_message_to_users(
                 await asyncio.sleep(max(float(exc.retry_after), 0.0) + 0.1)
             except TelegramForbiddenError:
                 blocked += 1
+                blocked_recipients.append(chat_id)
                 break
             except (TelegramBadRequest, TelegramAPIError) as exc:
                 failed += 1
                 LOGGER.warning(
-                    "Не удалось доставить глобальное оповещение пользователю %s: %s",
+                    "Не удалось доставить оповещение пользователю %s: %s",
                     chat_id,
                     exc,
                 )
@@ -73,4 +76,5 @@ async def copy_message_to_users(
         delivered=delivered,
         blocked=blocked,
         failed=failed,
+        blocked_recipients=tuple(blocked_recipients),
     )
