@@ -89,7 +89,15 @@ def test_persist_new_group_account(monkeypatch, tmp_path) -> None:
     accounts_file = tmp_path / "accounts.json"
 
     settings_file.write_text(
-        json.dumps({"accounts": {}, "references": {}}),
+        json.dumps(
+            {
+                "accounts": {},
+                "references": {
+                    "date": "01.01.2026",
+                    "color": "Белая неделя",
+                },
+            }
+        ),
         encoding="utf-8",
     )
     initial_schedule_file.write_text(
@@ -99,7 +107,10 @@ def test_persist_new_group_account(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(config, "GLOBAL_SETTINGS_FILE", settings_file)
     monkeypatch.setattr(config, "INITIAL_SCHEDULE_FILE", initial_schedule_file)
     monkeypatch.setattr(config, "SCHEDULE_FILE", schedule_file)
+    monkeypatch.setattr(config, "REFERENCE_FILE", tmp_path / "reference.json")
     monkeypatch.setattr(config, "SCHEDULE_ACCOUNTS_FILE", accounts_file)
+    monkeypatch.setattr(config, "SCHEDULE_BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(config, "SCHEDULE_BACKUP_LIMIT", 10)
     monkeypatch.delenv("SCHEDULE_ACCOUNTS_JSON", raising=False)
 
     added = _persist_verified_account(
@@ -133,7 +144,10 @@ def test_existing_group_credentials_are_not_saved(monkeypatch, tmp_path) -> None
                         "password": "configured-secret",
                     }
                 },
-                "references": {},
+                "references": {
+                    "date": "01.01.2026",
+                    "color": "Белая неделя",
+                },
             }
         ),
         encoding="utf-8",
@@ -142,7 +156,10 @@ def test_existing_group_credentials_are_not_saved(monkeypatch, tmp_path) -> None
     monkeypatch.setattr(config, "GLOBAL_SETTINGS_FILE", settings_file)
     monkeypatch.setattr(config, "INITIAL_SCHEDULE_FILE", initial_schedule_file)
     monkeypatch.setattr(config, "SCHEDULE_FILE", schedule_file)
+    monkeypatch.setattr(config, "REFERENCE_FILE", tmp_path / "reference.json")
     monkeypatch.setattr(config, "SCHEDULE_ACCOUNTS_FILE", accounts_file)
+    monkeypatch.setattr(config, "SCHEDULE_BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(config, "SCHEDULE_BACKUP_LIMIT", 10)
     monkeypatch.delenv("SCHEDULE_ACCOUNTS_JSON", raising=False)
 
     added = _persist_verified_account(
