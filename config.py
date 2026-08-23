@@ -78,6 +78,23 @@ SCHEDULE_UPDATE_INTERVAL_MINUTES = _int_env(
 SCHEDULE_UPDATE_MAX_ATTEMPTS = _int_env("SCHEDULE_UPDATE_MAX_ATTEMPTS", 3)
 SCHEDULE_UPDATE_RETRY_SECONDS = _int_env("SCHEDULE_UPDATE_RETRY_SECONDS", 10)
 SCHEDULE_PAGE_TIMEOUT_SECONDS = _int_env("SCHEDULE_PAGE_TIMEOUT_SECONDS", 35)
+SCHEDULE_RECOVERY_ENABLED = _bool_env("SCHEDULE_RECOVERY_ENABLED", False)
+SCHEDULE_RECOVERY_GROUP = os.getenv("SCHEDULE_RECOVERY_GROUP", "").strip()
+SCHEDULE_RECOVERY_INTERVAL_MINUTES = _int_env(
+    "SCHEDULE_RECOVERY_INTERVAL_MINUTES", 5, minimum=5
+)
+SCHEDULE_RECOVERY_JITTER_SECONDS = _int_env(
+    "SCHEDULE_RECOVERY_JITTER_SECONDS", 45, minimum=0
+)
+SCHEDULE_RECOVERY_HTTP_TIMEOUT_SECONDS = _int_env(
+    "SCHEDULE_RECOVERY_HTTP_TIMEOUT_SECONDS", 20, minimum=5
+)
+SCHEDULE_RECOVERY_CAPTURE_DIR = _path_env(
+    "SCHEDULE_RECOVERY_CAPTURE_DIR", str(DATA_DIR / "recovery-captures")
+)
+SCHEDULE_RECOVERY_STATE_FILE = _path_env(
+    "SCHEDULE_RECOVERY_STATE_FILE", str(DATA_DIR / "recovery-state.json")
+)
 
 
 def _validated_schedule_accounts(value: Any) -> dict[str, dict[str, str]]:
@@ -135,3 +152,7 @@ def validate_runtime_config() -> None:
         )
     if SCHEDULE_BROWSER not in {"chromium", "firefox", "webkit"}:
         raise RuntimeError("SCHEDULE_BROWSER должен быть chromium, firefox или webkit")
+    if SCHEDULE_RECOVERY_ENABLED and not SCHEDULE_RECOVERY_GROUP:
+        raise RuntimeError(
+            "При SCHEDULE_RECOVERY_ENABLED=true задайте SCHEDULE_RECOVERY_GROUP"
+        )

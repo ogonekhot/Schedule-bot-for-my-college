@@ -61,6 +61,32 @@ BOT_API_IS_LOCAL=true
 | `SCHEDULE_HEADLESS` | `true` | запуск браузера без окна |
 | `BOT_TIMEZONE` | `Europe/Moscow` | часовой пояс расписания |
 
+### Одноразовый recovery-monitor
+
+Если авторизация ЛК временно сломана, можно включить щадящий монитор одной
+приоритетной группы:
+
+```dotenv
+SCHEDULE_RECOVERY_ENABLED=true
+SCHEDULE_RECOVERY_GROUP=Т9-ИП-24-1
+SCHEDULE_RECOVERY_INTERVAL_MINUTES=5
+SCHEDULE_RECOVERY_JITTER_SECONDS=45
+SCHEDULE_RECOVERY_HTTP_TIMEOUT_SECONDS=20
+```
+
+Монитор делает одну лёгкую AJAX-попытку входа за запуск. Пока вход не работает,
+Playwright не запускается и обычное обновление остальных групп откладывается.
+При первом ответе с `REDIRECT_URL` бот переносит PHP-сессию в браузер, перехватывает
+точный запрос и сырой ответ `/ajax.handler.php`, обновляет только выбранную группу
+поверх существующего кеша и прекращает сетевые попытки. Расписание других групп
+не удаляется.
+
+Диагностический захват сохраняется с правами `0600` в
+`data/recovery-captures/`, а `data/recovery-state.json` отмечает успешное
+завершение. Cookies и пароли в захват не записываются. Чтобы вручную запустить
+одноразовый монитор повторно, остановите бота и удалите только
+`data/recovery-state.json`, затем снова запустите сервис.
+
 Интервал меньше пяти минут намеренно не допускается, чтобы не нагружать сайт колледжа.
 
 Аккаунты передаются одним JSON-объектом:
@@ -106,3 +132,4 @@ pip install -r requirements-dev.txt
 python -m playwright install chromium
 python -m pytest
 ```
+

@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 import config
 
 
@@ -80,3 +82,12 @@ def test_runtime_accounts_override_same_group(monkeypatch, tmp_path) -> None:
         "login": "runtime-login",
         "password": "runtime-password",
     }
+
+
+def test_recovery_requires_target_group(monkeypatch) -> None:
+    monkeypatch.setattr(config, "TOKEN", "test-token")
+    monkeypatch.setattr(config, "SCHEDULE_RECOVERY_ENABLED", True)
+    monkeypatch.setattr(config, "SCHEDULE_RECOVERY_GROUP", "")
+
+    with pytest.raises(RuntimeError, match="SCHEDULE_RECOVERY_GROUP"):
+        config.validate_runtime_config()

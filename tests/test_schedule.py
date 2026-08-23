@@ -9,8 +9,11 @@ from moduls.schedule import (
     WHITE_WEEK,
     ScheduleUpdateError,
     _persist_verified_account,
+    _persist_recovered_group,
+    _redact_recovery_value,
     detect_group_name,
     parse_schedule_html,
+    recovery_is_complete,
 )
 
 SCHEDULE_HTML = """
@@ -170,4 +173,67 @@ def test_existing_group_credentials_are_not_saved(monkeypatch, tmp_path) -> None
 
     assert added is False
     assert accounts_file.exists() is False
+
+
+def test_recovered_group_preserves_other_cached_groups(monkeypatch, tmp_path) -> None:
+    settings_file = tmp_path / "global.json"
+    initial_schedule_file = tmp_path / "initial-schedule.json"
+    schedule_file = tmp_path / "schedule.json"
+    reference_file = tmp_path / "reference.json"
+
+    settings_file.write_text(
+        json.dumps(
+            {
+                "accounts": {},
+                "references": {
+                    "date": "01.01.2026",
+                    "color": WHITE_WEEK,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    initial_schedule_file.write_text(
+        json.dumps({"Т9-ИП-24-2": {"ПН": {"1": {"old": True}}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "GLOBAL_SETTINGS_FILE", settings_file)
+    monkeypatch.setattr(config, "INITIAL_SCHEDULE_FILE", initial_schedule_file)
+    monkeypatch.setattr(config, "SCHEDULE_FILE", schedule_file)
+    monkeypatch.setattr(config, "REFERENCE_FILE", reference_file)
+    monkeypatch.setattr(config, "SCHEDULE_BACKUP_DIR", tmp_path / "backups")
+    monkeypatch.setattr(config, "SCHEDULE_BACKUP_LIMIT", 10)
+
+    result = _persist_recovered_group(
+        "Т9-ИП-24-1",
+        {"ПН": {"1": {"new": True}}},
+        GREEN_WEEK,
+    )
+
+    saved = json.loads(schedule_file.read_text(encoding="utf-8"))
+    assert list(saved) == ["Т9-ИП-24-2", "Т9-ИП-24-1"]
+    assert saved["Т9-ИП-24-2"]["ПН"]["1"] == {"old": True}
+    assert saved["Т9-ИП-24-1"]["ПН"]["1"] == {"new": True}
+    assert result.groups == ("Т9-ИП-24-1",)
+    assert json.loads(reference_file.read_text(encoding="utf-8"))["color"] == GREEN_WEEK
+
+
+def test_recovery_state_must_match_target_group(monkeypatch, tmp_path) -> None:
+    state_file = tmp_path / "recovery-state.json"
+    state_file.write_text(
+        json.dumps({"completed": True, "group": "Т9-ИП-24-1"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "SCHEDULE_RECOVERY_STATE_FILE", state_file)
+    monkeypatch.setattr(config, "SCHEDULE_RECOVERY_GROUP", "Т9-ИП-24-1")
+
+    assert recovery_is_complete() is True
+    assert recovery_is_complete("Т9-ИП-24-2") is False
+
+
+def test_recovery_redaction_hides_both_credentials() -> None:
+    assert _redact_recovery_value(
+        "LOGIN=student&PASSWORD=very-secret",
+        {"login": "student", "password": "very-secret"},
+    ) == "LOGIN=<hidden>&PASSWORD=<hidden>"
 

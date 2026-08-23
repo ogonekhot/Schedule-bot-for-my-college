@@ -12,12 +12,15 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
+import aiohttp
 from bs4 import BeautifulSoup, Tag
 from playwright.async_api import (
     Browser,
     Page,
+    Route,
     Response,
     async_playwright,
 )
@@ -72,6 +75,12 @@ class UpdateResult:
     reference_date: str
     reference_color: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class RecoveryResult:
+    update: UpdateResult
+    capture_dir: Path
 
 
 def _empty_lesson(start: str, end: str) -> dict[str, Any]:
@@ -186,6 +195,434 @@ def _decode_body(body: bytes) -> str:
         except UnicodeDecodeError:
             continue
     return body.decode("cp1251", errors="replace")
+
+
+def recovery_is_complete(group: str | None = None) -> bool:
+    """Return whether the configured one-shot recovery has already succeeded."""
+
+    target_group = group or config.SCHEDULE_RECOVERY_GROUP
+    if not target_group or not config.SCHEDULE_RECOVERY_STATE_FILE.exists():
+        return False
+    try:
+        with config.SCHEDULE_RECOVERY_STATE_FILE.open(
+            "r", encoding="utf-8-sig"
+        ) as file:
+            state = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(
+        state.get("completed") is True and state.get("group") == target_group
+    )
+
+
+def _redact_recovery_value(value: str, credentials: dict[str, str]) -> str:
+    result = value
+    for secret in (credentials.get("login", ""), credentials.get("password", "")):
+        if secret:
+            result = result.replace(secret, "<hidden>")
+    return result
+
+
+async def _authenticate_recovery_session(
+    credentials: dict[str, str],
+) -> tuple[aiohttp.ClientSession, str, str]:
+    """Perform the lightweight AJAX login used by the college page."""
+
+    timeout = aiohttp.ClientTimeout(
+        total=config.SCHEDULE_RECOVERY_HTTP_TIMEOUT_SECONDS,
+        connect=min(10, config.SCHEDULE_RECOVERY_HTTP_TIMEOUT_SECONDS),
+    )
+    session = aiohttp.ClientSession(
+        timeout=timeout,
+        cookie_jar=aiohttp.CookieJar(unsafe=True),
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+            ),
+            "Accept-Language": "ru-RU,ru;q=0.9",
+        },
+    )
+    try:
+        async with session.get(
+            config.COLLEGE_LOGIN_URL,
+            allow_redirects=True,
+        ) as response:
+            login_body = await response.read()
+            login_url = str(response.url)
+            if response.status != 200:
+                raise ScheduleUpdateError(
+                    f"форма входа вернула HTTP {response.status}"
+                )
+
+        login_html = _decode_body(login_body)
+        soup = BeautifulSoup(login_html, "html.parser")
+        form = soup.select_one("form#auth_form")
+        if form is None:
+            raise ScheduleUpdateError("на странице не найдена форма авторизации")
+
+        form_data = {
+            element["name"]: element.get("value", "")
+            for element in form.select("input[name]")
+        }
+        form_data.update(
+            {
+                "AUTH_FORM": "1",
+                "LOGIN": credentials["login"],
+                "PASSWORD": credentials["password"],
+            }
+        )
+        action_url = urljoin(login_url, form.get("action") or "/index.php")
+        action_parts = urlsplit(action_url)
+        origin = f"{action_parts.scheme}://{action_parts.netloc}"
+
+        async with session.post(
+            action_url,
+            data=form_data,
+            headers={
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": origin,
+                "Referer": login_url,
+            },
+            allow_redirects=False,
+        ) as response:
+            auth_body = await response.read()
+            auth_text = _decode_body(auth_body).lstrip("\ufeff").strip()
+            if response.status != 200:
+                raise ScheduleUpdateError(
+                    f"авторизация вернула HTTP {response.status}"
+                )
+
+        try:
+            auth_result = json.loads(auth_text)
+        except json.JSONDecodeError as exc:
+            message = re.sub(
+                r"\s+",
+                " ",
+                BeautifulSoup(auth_text, "html.parser").get_text(" ", strip=True),
+            )
+            message = _redact_recovery_value(message, credentials)[:160]
+            raise ScheduleUpdateError(
+                "авторизация ЛГТУ ещё не восстановилась"
+                + (f": {message}" if message else "")
+            ) from exc
+
+        if not isinstance(auth_result, dict):
+            raise ScheduleUpdateError("авторизация вернула неожиданный JSON")
+        if auth_result.get("ERRORS"):
+            errors = _redact_recovery_value(
+                json.dumps(auth_result["ERRORS"], ensure_ascii=False),
+                credentials,
+            )
+            raise ScheduleCredentialsError(f"сайт отклонил аккаунт: {errors[:200]}")
+
+        redirect_value = str(auth_result.get("REDIRECT_URL", "")).strip()
+        if not redirect_value:
+            raise ScheduleUpdateError(
+                "авторизация не вернула REDIRECT_URL; повторим позже"
+            )
+        redirect_url = urljoin(action_url, redirect_value)
+
+        async with session.get(redirect_url, allow_redirects=True) as response:
+            authenticated_body = await response.read()
+            authenticated_url = str(response.url)
+            if response.status != 200:
+                raise ScheduleUpdateError(
+                    f"личный кабинет вернул HTTP {response.status}"
+                )
+
+        authenticated_html = _decode_body(authenticated_body)
+        authenticated_soup = BeautifulSoup(authenticated_html, "html.parser")
+        if authenticated_soup.select_one("input[name='LOGIN']") is not None:
+            raise ScheduleUpdateError(
+                "после REDIRECT_URL сайт снова вернул форму входа"
+            )
+        return session, authenticated_html, authenticated_url
+    except BaseException:
+        await session.close()
+        raise
+
+
+def _recovery_playwright_cookies(
+    session: aiohttp.ClientSession,
+) -> list[dict[str, Any]]:
+    login_host = urlsplit(config.COLLEGE_LOGIN_URL).hostname or ""
+    cookies: list[dict[str, Any]] = []
+    for cookie in session.cookie_jar:
+        domain = cookie["domain"] or login_host
+        if not domain:
+            continue
+        cookies.append(
+            {
+                "name": cookie.key,
+                "value": cookie.value,
+                "domain": domain,
+                "path": cookie["path"] or "/",
+                "secure": bool(cookie["secure"]),
+            }
+        )
+    return cookies
+
+
+async def _recovery_route(route: Route) -> None:
+    request = route.request
+    path = urlsplit(request.url).path.casefold()
+    blocked_scripts = (
+        "/bootstrap.min.js",
+        "/jquery.maskedinput.min.js",
+        "/main-1.69.js",
+        "/ba.js",
+    )
+    if request.resource_type in {"image", "media", "font", "stylesheet"}:
+        await route.abort()
+    elif request.resource_type == "script" and path.endswith(blocked_scripts):
+        await route.abort()
+    else:
+        await route.continue_()
+
+
+async def _capture_recovery_schedule(
+    session: aiohttp.ClientSession,
+    credentials: dict[str, str],
+) -> tuple[str, str, str | None, dict[str, Any]]:
+    """Reuse the authenticated PHP session and capture the schedule AJAX call."""
+
+    timeout_ms = config.SCHEDULE_PAGE_TIMEOUT_SECONDS * 1000
+    async with async_playwright() as playwright:
+        browser_type = getattr(playwright, config.SCHEDULE_BROWSER)
+        browser = await browser_type.launch(headless=config.SCHEDULE_HEADLESS)
+        context = await browser.new_context(ignore_https_errors=True)
+        page = await context.new_page()
+        page.set_default_timeout(timeout_ms)
+        cookies = _recovery_playwright_cookies(session)
+        if cookies:
+            await context.add_cookies(cookies)
+        await page.route("**/*", _recovery_route)
+
+        loop = asyncio.get_running_loop()
+        response_future: asyncio.Future[tuple[str, dict[str, Any]]] = (
+            loop.create_future()
+        )
+
+        async def capture(response: Response) -> None:
+            if "ajax.handler.php" not in response.url or response_future.done():
+                return
+            try:
+                body = _decode_body(await response.body())
+                if "<tbody" not in body.casefold():
+                    return
+                request = response.request
+                safe_headers = {
+                    key: _redact_recovery_value(value, credentials)
+                    for key, value in request.headers.items()
+                    if key.casefold() not in {"authorization", "cookie"}
+                }
+                metadata = {
+                    "url": request.url,
+                    "method": request.method,
+                    "post_data": _redact_recovery_value(
+                        request.post_data or "", credentials
+                    ),
+                    "headers": safe_headers,
+                    "response_status": response.status,
+                }
+                response_future.set_result((body, metadata))
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("Не удалось захватить AJAX расписания: %s", exc)
+
+        page.on("response", capture)
+        try:
+            try:
+                await page.goto(
+                    config.COLLEGE_SCHEDULE_URL,
+                    wait_until="commit",
+                    timeout=timeout_ms,
+                )
+            except PlaywrightTimeoutError:
+                LOGGER.debug(
+                    "Переход к расписанию не завершился, ожидаем AJAX-ответ"
+                )
+
+            try:
+                ajax_html, request_metadata = await asyncio.wait_for(
+                    response_future,
+                    timeout=config.SCHEDULE_PAGE_TIMEOUT_SECONDS,
+                )
+            except TimeoutError as exc:
+                current_html = await page.content()
+                if BeautifulSoup(current_html, "html.parser").select_one(
+                    "input[name='LOGIN']"
+                ) is not None:
+                    raise ScheduleUpdateError(
+                        "PHP-сессия потерялась при переходе к расписанию"
+                    ) from exc
+                raise ScheduleUpdateError(
+                    "вход сработал, но AJAX расписания пока не ответил"
+                ) from exc
+
+            page_html = await page.content()
+            week_color = await _read_week_color(page)
+            request_metadata["page_url"] = page.url
+            request_metadata["scripts"] = [
+                urljoin(page.url, script.get("src", ""))
+                for script in BeautifulSoup(page_html, "html.parser").select(
+                    "script[src]"
+                )
+            ]
+            return ajax_html, page_html, week_color, request_metadata
+        finally:
+            page.remove_listener("response", capture)
+            if not response_future.done():
+                response_future.cancel()
+            await context.close()
+            await browser.close()
+
+
+def _atomic_text_dump(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            file.write(value)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_name, path)
+        os.chmod(path, 0o600)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _write_recovery_capture(
+    group: str,
+    credentials: dict[str, str],
+    authenticated_html: str,
+    authenticated_url: str,
+    schedule_page_html: str,
+    ajax_html: str,
+    request_metadata: dict[str, Any],
+) -> Path:
+    now = datetime.now(ZoneInfo(config.BOT_TIMEZONE))
+    safe_group = re.sub(r"[^\w.-]+", "-", group, flags=re.UNICODE).strip("-")
+    capture_dir = config.SCHEDULE_RECOVERY_CAPTURE_DIR / (
+        f"{now.strftime('%Y%m%d-%H%M%S')}-{safe_group}"
+    )
+    capture_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
+    os.chmod(capture_dir, 0o700)
+
+    safe_metadata = json.loads(
+        _redact_recovery_value(
+            json.dumps(request_metadata, ensure_ascii=False), credentials
+        )
+    )
+    manifest = {
+        "group": group,
+        "captured_at": now.isoformat(timespec="seconds"),
+        "authenticated_url": authenticated_url,
+        "schedule_url": config.COLLEGE_SCHEDULE_URL,
+        "cookies_saved": False,
+    }
+    _atomic_text_dump(capture_dir / "authenticated-page.html", authenticated_html)
+    _atomic_text_dump(capture_dir / "schedule-page.html", schedule_page_html)
+    _atomic_text_dump(capture_dir / "schedule-response.html", ajax_html)
+    _atomic_text_dump(
+        capture_dir / "request.json",
+        json.dumps(safe_metadata, ensure_ascii=False, indent=2) + "\n",
+    )
+    _atomic_text_dump(
+        capture_dir / "manifest.json",
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+    )
+    return capture_dir
+
+
+def _persist_recovered_group(
+    group: str,
+    group_schedule: dict[str, dict[str, Any]],
+    week_color: str | None,
+) -> UpdateResult:
+    settings = _load_global_settings()
+    cached_schedule = _load_schedule_cache()
+    cached_schedule[group] = group_schedule
+
+    fallback_color = settings.get("references", {}).get("color", WHITE_WEEK)
+    if config.REFERENCE_FILE.exists():
+        try:
+            with config.REFERENCE_FILE.open("r", encoding="utf-8-sig") as file:
+                fallback_color = json.load(file).get("color", fallback_color)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    now = datetime.now(ZoneInfo(config.BOT_TIMEZONE))
+    state = {
+        "date": now.strftime("%d.%m.%Y"),
+        "color": week_color or fallback_color,
+        "updated_at": now.isoformat(timespec="seconds"),
+    }
+    create_schedule_backup("schedule_recovery")
+    _atomic_json_dump(config.SCHEDULE_FILE, cached_schedule)
+    _atomic_json_dump(config.REFERENCE_FILE, state)
+    return UpdateResult(
+        groups=(group,),
+        reference_date=state["date"],
+        reference_color=state["color"],
+        updated_at=state["updated_at"],
+    )
+
+
+async def recover_priority_group() -> RecoveryResult:
+    """Try the configured group once and permanently record the first success."""
+
+    group = config.SCHEDULE_RECOVERY_GROUP
+    if not group:
+        raise ScheduleUpdateError("не задана SCHEDULE_RECOVERY_GROUP")
+    if recovery_is_complete(group):
+        raise ScheduleUpdateError(f"восстановление группы {group} уже завершено")
+
+    settings = _load_global_settings()
+    accounts = config.load_schedule_accounts(settings)
+    credentials = accounts.get(group)
+    if credentials is None:
+        raise ScheduleUpdateError(f"для группы {group} не найден аккаунт ЛГТУ")
+
+    session, authenticated_html, authenticated_url = (
+        await _authenticate_recovery_session(credentials)
+    )
+    try:
+        ajax_html, page_html, week_color, request_metadata = (
+            await _capture_recovery_schedule(session, credentials)
+        )
+    finally:
+        await session.close()
+
+    group_schedule = parse_schedule_html(ajax_html)
+    capture_dir = _write_recovery_capture(
+        group,
+        credentials,
+        authenticated_html,
+        authenticated_url,
+        page_html,
+        ajax_html,
+        request_metadata,
+    )
+    update = _persist_recovered_group(group, group_schedule, week_color)
+    _atomic_json_dump(
+        config.SCHEDULE_RECOVERY_STATE_FILE,
+        {
+            "completed": True,
+            "group": group,
+            "completed_at": update.updated_at,
+            "capture_dir": str(capture_dir),
+        },
+    )
+    os.chmod(config.SCHEDULE_RECOVERY_STATE_FILE, 0o600)
+    return RecoveryResult(update=update, capture_dir=capture_dir)
 
 
 async def _wait_for_schedule_response(page: Page) -> str:

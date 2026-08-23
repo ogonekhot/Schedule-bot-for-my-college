@@ -131,6 +131,15 @@ async def refresh_schedule() -> schedule_source.UpdateResult:
 
 
 async def scheduled_refresh() -> None:
+    if (
+        config.SCHEDULE_RECOVERY_ENABLED
+        and not schedule_source.recovery_is_complete()
+    ):
+        LOGGER.info(
+            "Обычное обновление отложено: recovery-monitor ждёт группу %s",
+            config.SCHEDULE_RECOVERY_GROUP,
+        )
+        return
     if not runtime_settings.is_auto_update_enabled():
         LOGGER.info("Автоматическое обновление расписания отключено")
         return
@@ -142,6 +151,53 @@ async def scheduled_refresh() -> None:
     except Exception as exc:  # noqa: BLE001 - keep cached data on every update failure
         # The cached schedule remains available; the next scheduled run retries.
         LOGGER.debug("Плановое обновление завершилось ошибкой: %s", exc)
+
+
+async def scheduled_recovery(bot: Bot) -> None:
+    """Make one low-rate attempt for the priority group and stop after success."""
+
+    global last_update_error
+    if not config.SCHEDULE_RECOVERY_ENABLED:
+        return
+    if schedule_source.recovery_is_complete():
+        return
+    if refresh_lock.locked():
+        LOGGER.info("Recovery-monitor пропустил запуск: обновление уже выполняется")
+        return
+
+    try:
+        async with refresh_lock:
+            result = await schedule_source.recover_priority_group()
+            reload_runtime_data()
+            last_update_error = None
+    except Exception as exc:  # noqa: BLE001 - the next interval retries once
+        last_update_error = str(exc)
+        LOGGER.warning(
+            "Recovery-monitor: группа %s пока недоступна: %s",
+            config.SCHEDULE_RECOVERY_GROUP,
+            exc,
+        )
+        return
+
+    LOGGER.info(
+        "Recovery-monitor получил расписание %s; захват сохранён в %s",
+        config.SCHEDULE_RECOVERY_GROUP,
+        result.capture_dir,
+    )
+    message = (
+        "✅ ЛК ЛГТУ ожил. Расписание группы "
+        f"{config.SCHEDULE_RECOVERY_GROUP} получено и сохранено.\n\n"
+        f"Время обновления: {result.update.updated_at}\n"
+        "Recovery-monitor остановил сетевые попытки."
+    )
+    for admin_id in settings.get("admins", []):
+        try:
+            await bot.send_message(int(admin_id), message)
+        except Exception:  # noqa: BLE001 - capture success must not be rolled back
+            LOGGER.exception(
+                "Не удалось уведомить администратора %s о восстановлении ЛК",
+                admin_id,
+            )
 
 
 async def check_registration(event: types.Message | types.CallbackQuery) -> bool:
@@ -716,6 +772,7 @@ async def show_admin_panel(callback: types.CallbackQuery) -> bool:
 def _backup_reason_label(reason: str) -> str:
     return {
         "schedule_update": "перед обновлением",
+        "schedule_recovery": "перед аварийным восстановлением",
         "group_registration": "перед добавлением группы",
         "before_restore": "перед восстановлением",
         "manual": "создана вручную",
@@ -1261,10 +1318,32 @@ async def main() -> None:
         coalesce=True,
         max_instances=1,
     )
+    if (
+        config.SCHEDULE_RECOVERY_ENABLED
+        and not schedule_source.recovery_is_complete()
+    ):
+        scheduler.add_job(
+            scheduled_recovery,
+            "interval",
+            args=(bot,),
+            minutes=config.SCHEDULE_RECOVERY_INTERVAL_MINUTES,
+            jitter=config.SCHEDULE_RECOVERY_JITTER_SECONDS,
+            id="schedule-recovery",
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+        )
     scheduler.start()
 
     startup_task: asyncio.Task | None = None
-    if config.SCHEDULE_UPDATE_ON_STARTUP:
+    if (
+        config.SCHEDULE_RECOVERY_ENABLED
+        and not schedule_source.recovery_is_complete()
+    ):
+        startup_task = asyncio.create_task(
+            scheduled_recovery(bot), name="startup-recovery"
+        )
+    elif config.SCHEDULE_UPDATE_ON_STARTUP:
         startup_task = asyncio.create_task(scheduled_refresh(), name="startup-refresh")
 
     try:
@@ -1284,3 +1363,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
