@@ -49,6 +49,9 @@ INITIAL_SCHEDULE_FILE = _path_env("INITIAL_SCHEDULE_FILE", "settings/schedule.js
 DATA_DIR = _path_env("DATA_DIR", "data")
 SCHEDULE_FILE = _path_env("SCHEDULE_FILE", str(DATA_DIR / "schedule.json"))
 REFERENCE_FILE = _path_env("REFERENCE_FILE", str(DATA_DIR / "reference.json"))
+SCHEDULE_ACCOUNTS_FILE = _path_env(
+    "SCHEDULE_ACCOUNTS_FILE", str(DATA_DIR / "accounts.json")
+)
 
 # College site and automatic updates
 COLLEGE_LOGIN_URL = os.getenv("COLLEGE_LOGIN_URL", "http://lk.stu.lipetsk.ru/").strip()
@@ -67,25 +70,12 @@ SCHEDULE_UPDATE_RETRY_SECONDS = _int_env("SCHEDULE_UPDATE_RETRY_SECONDS", 10)
 SCHEDULE_PAGE_TIMEOUT_SECONDS = _int_env("SCHEDULE_PAGE_TIMEOUT_SECONDS", 35)
 
 
-def load_schedule_accounts(settings: dict[str, Any]) -> dict[str, dict[str, str]]:
-    """Load college accounts from an env JSON object or global settings."""
-
-    raw = os.getenv("SCHEDULE_ACCOUNTS_JSON", "").strip()
-    if raw:
-        try:
-            accounts = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "SCHEDULE_ACCOUNTS_JSON содержит некорректный JSON"
-            ) from exc
-    else:
-        accounts = settings.get("accounts", {})
-
-    if not isinstance(accounts, dict):
+def _validated_schedule_accounts(value: Any) -> dict[str, dict[str, str]]:
+    if not isinstance(value, dict):
         raise TypeError("Список аккаунтов расписания должен быть JSON-объектом")
 
     validated: dict[str, dict[str, str]] = {}
-    for group, credentials in accounts.items():
+    for group, credentials in value.items():
         if not isinstance(credentials, dict):
             continue
         login = str(credentials.get("login", "")).strip()
@@ -94,6 +84,39 @@ def load_schedule_accounts(settings: dict[str, Any]) -> dict[str, dict[str, str]
             validated[str(group)] = {"login": login, "password": password}
     return validated
 
+
+def load_runtime_schedule_accounts() -> dict[str, dict[str, str]]:
+    """Load accounts added by users through the Telegram registration flow."""
+
+    if not SCHEDULE_ACCOUNTS_FILE.exists():
+        return {}
+    try:
+        with SCHEDULE_ACCOUNTS_FILE.open("r", encoding="utf-8-sig") as file:
+            value = json.load(file)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Не удалось загрузить {SCHEDULE_ACCOUNTS_FILE}: {exc}"
+        ) from exc
+    return _validated_schedule_accounts(value)
+
+
+def load_schedule_accounts(settings: dict[str, Any]) -> dict[str, dict[str, str]]:
+    """Merge bundled, environment and user-added college accounts."""
+
+    accounts = _validated_schedule_accounts(settings.get("accounts", {}))
+
+    raw = os.getenv("SCHEDULE_ACCOUNTS_JSON", "").strip()
+    if raw:
+        try:
+            environment_accounts = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "SCHEDULE_ACCOUNTS_JSON содержит некорректный JSON"
+            ) from exc
+        accounts.update(_validated_schedule_accounts(environment_accounts))
+
+    accounts.update(load_runtime_schedule_accounts())
+    return accounts
 
 def validate_runtime_config() -> None:
     if not TOKEN:
