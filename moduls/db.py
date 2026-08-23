@@ -81,6 +81,19 @@ async def get_college_account_link(user_id: int) -> CollegeAccountLink | None:
         conn.close()
 
 
+def _normalize_college_account_link(
+    login: str,
+    group_name: str,
+) -> tuple[str, str]:
+    normalized_login = login.strip()
+    normalized_group = group_name.strip()
+    if not normalized_login or not normalized_group:
+        raise ValueError("Логин и группа ЛГТУ не могут быть пустыми")
+    if len(normalized_login) > 256 or len(normalized_group) > 64:
+        raise ValueError("Логин или группа ЛГТУ слишком длинные")
+    return normalized_login, normalized_group
+
+
 async def save_college_account_link(
     user_id: int,
     login: str,
@@ -88,16 +101,50 @@ async def save_college_account_link(
 ) -> None:
     """Save or replace a verified personal college-account link."""
 
-    normalized_login = login.strip()
-    normalized_group = group_name.strip()
-    if not normalized_login or not normalized_group:
-        raise ValueError("Логин и группа ЛГТУ не могут быть пустыми")
-    if len(normalized_login) > 256 or len(normalized_group) > 64:
-        raise ValueError("Логин или группа ЛГТУ слишком длинные")
+    normalized_login, normalized_group = _normalize_college_account_link(
+        login,
+        group_name,
+    )
 
     conn = await connect()
     try:
         async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO college_account_links (user_id, login, group_name)
+                VALUES (%s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    login=VALUES(login),
+                    group_name=VALUES(group_name)
+                """,
+                (user_id, normalized_login, normalized_group),
+            )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+async def save_user_group_and_college_account_link(
+    user_id: int,
+    login: str,
+    group_name: str,
+) -> None:
+    """Persist the selected group and verified personal link atomically."""
+
+    normalized_login, normalized_group = _normalize_college_account_link(
+        login,
+        group_name,
+    )
+    conn = await connect()
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE settings SET group_name=%s WHERE id=%s",
+                (normalized_group, user_id),
+            )
             await cursor.execute(
                 """
                 INSERT INTO college_account_links (user_id, login, group_name)

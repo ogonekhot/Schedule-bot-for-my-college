@@ -591,12 +591,7 @@ async def receive_college_password(
                 )
                 reload_runtime_data()
                 user_id = (await dbm.check_tg_id(message.from_user.id))[0]
-                await dbm.update_user_settings(
-                    user_id,
-                    "group_name",
-                    result.group,
-                )
-                await dbm.save_college_account_link(
+                await dbm.save_user_group_and_college_account_link(
                     user_id,
                     login,
                     result.group,

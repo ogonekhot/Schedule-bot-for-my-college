@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 import moduls.db as dbm
 
 
@@ -160,4 +162,68 @@ def test_college_account_link_is_saved_without_password(monkeypatch) -> None:
     assert cursor.params == (42, "s1241000754", "Т9-ИП-24-1")
     assert "password" not in cursor.query.casefold()
     assert connection.committed is True
+    assert connection.closed is True
+
+
+
+def test_group_and_college_link_are_committed_together(monkeypatch) -> None:
+    cursor = FakeCursor([])
+    connection = FakeConnection(cursor)
+
+    async def fake_connect() -> FakeConnection:
+        return connection
+
+    monkeypatch.setattr(dbm, "connect", fake_connect)
+
+    asyncio.run(
+        dbm.save_user_group_and_college_account_link(
+            42,
+            " s1241000754 ",
+            " Т9-ИП-24-1 ",
+        )
+    )
+
+    assert cursor.executions[0] == (
+        "UPDATE settings SET group_name=%s WHERE id=%s",
+        ("Т9-ИП-24-1", 42),
+    )
+    assert cursor.executions[1][0].startswith(
+        "INSERT INTO college_account_links"
+    )
+    assert cursor.executions[1][1] == (42, "s1241000754", "Т9-ИП-24-1")
+    assert connection.committed is True
+    assert connection.rolled_back is False
+    assert connection.closed is True
+
+
+def test_group_and_college_link_roll_back_together(monkeypatch) -> None:
+    class FailingCursor(FakeCursor):
+        async def execute(
+            self,
+            query: str,
+            params: tuple[object, ...],
+        ) -> None:
+            await super().execute(query, params)
+            if self.query.startswith("INSERT INTO college_account_links"):
+                raise RuntimeError("database write failed")
+
+    cursor = FailingCursor([])
+    connection = FakeConnection(cursor)
+
+    async def fake_connect() -> FakeConnection:
+        return connection
+
+    monkeypatch.setattr(dbm, "connect", fake_connect)
+
+    with pytest.raises(RuntimeError, match="database write failed"):
+        asyncio.run(
+            dbm.save_user_group_and_college_account_link(
+                42,
+                "s1241000754",
+                "Т9-ИП-24-1",
+            )
+        )
+
+    assert connection.committed is False
+    assert connection.rolled_back is True
     assert connection.closed is True
