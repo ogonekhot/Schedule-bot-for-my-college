@@ -14,3 +14,12 @@ CREATE TABLE IF NOT EXISTS settings (
         FOREIGN KEY (id) REFERENCES users (id)
         ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS college_account_links (
+    user_id BIGINT NOT NULL,
+    login VARCHAR(256) NOT NULL,
+    group_name VARCHAR(64) NOT NULL,
+    linked_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

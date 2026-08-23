@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 import aiomysql
 
 import config
 
 ALLOWED_SETTINGS_FIELDS = {"group_name"}
+
+
+@dataclass(frozen=True)
+class CollegeAccountLink:
+    """Personal college account linked to one bot user."""
+
+    login: str
+    group_name: str
 
 
 async def connect() -> aiomysql.Connection:
@@ -20,6 +29,138 @@ async def connect() -> aiomysql.Connection:
         db=config.DB_NAME,
         autocommit=False,
     )
+
+
+async def ensure_profile_schema() -> None:
+    """Create storage for personal college-account links when upgrading."""
+
+    conn = await connect()
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS college_account_links (
+                    user_id BIGINT NOT NULL,
+                    login VARCHAR(256) NOT NULL,
+                    group_name VARCHAR(64) NOT NULL,
+                    linked_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                        ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    COLLATE=utf8mb4_unicode_ci
+                """,
+                (),
+            )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+async def get_college_account_link(user_id: int) -> CollegeAccountLink | None:
+    """Return the user's verified college login without exposing its password."""
+
+    conn = await connect()
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT login, group_name
+                FROM college_account_links
+                WHERE user_id=%s
+                """,
+                (user_id,),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return CollegeAccountLink(login=str(row[0]), group_name=str(row[1]))
+    finally:
+        conn.close()
+
+
+def _normalize_college_account_link(
+    login: str,
+    group_name: str,
+) -> tuple[str, str]:
+    normalized_login = login.strip()
+    normalized_group = group_name.strip()
+    if not normalized_login or not normalized_group:
+        raise ValueError("Логин и группа ЛГТУ не могут быть пустыми")
+    if len(normalized_login) > 256 or len(normalized_group) > 64:
+        raise ValueError("Логин или группа ЛГТУ слишком длинные")
+    return normalized_login, normalized_group
+
+
+async def save_college_account_link(
+    user_id: int,
+    login: str,
+    group_name: str,
+) -> None:
+    """Save or replace a verified personal college-account link."""
+
+    normalized_login, normalized_group = _normalize_college_account_link(
+        login,
+        group_name,
+    )
+
+    conn = await connect()
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO college_account_links (user_id, login, group_name)
+                VALUES (%s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    login=VALUES(login),
+                    group_name=VALUES(group_name)
+                """,
+                (user_id, normalized_login, normalized_group),
+            )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+async def save_user_group_and_college_account_link(
+    user_id: int,
+    login: str,
+    group_name: str,
+) -> None:
+    """Persist the selected group and verified personal link atomically."""
+
+    normalized_login, normalized_group = _normalize_college_account_link(
+        login,
+        group_name,
+    )
+    conn = await connect()
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE settings SET group_name=%s WHERE id=%s",
+                (normalized_group, user_id),
+            )
+            await cursor.execute(
+                """
+                INSERT INTO college_account_links (user_id, login, group_name)
+                VALUES (%s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    login=VALUES(login),
+                    group_name=VALUES(group_name)
+                """,
+                (user_id, normalized_login, normalized_group),
+            )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 async def check_tg_id(tg_id: int) -> list:
@@ -114,7 +255,16 @@ async def delete_users_by_telegram_ids(telegram_ids: Iterable[int]) -> int:
     try:
         async with conn.cursor() as cursor:
             # Production may use the legacy schema without ON DELETE CASCADE,
-            # so settings are removed explicitly before their users.
+            # so related rows are removed explicitly before their users.
+            await cursor.execute(
+                f"""
+                DELETE college_account_links
+                FROM college_account_links
+                INNER JOIN users ON users.id = college_account_links.user_id
+                WHERE users.tg_id IN ({placeholders})
+                """,
+                unique_ids,
+            )
             await cursor.execute(
                 f"""
                 DELETE settings
