@@ -15,11 +15,14 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
+import moduls.broadcast as broadcast_service
 import moduls.db as dbm
 import moduls.schedule as schedule_source
 import moduls.time as tm
@@ -30,8 +33,14 @@ logging.basicConfig(
 )
 LOGGER = logging.getLogger(__name__)
 
+class BroadcastFlow(StatesGroup):
+    waiting_for_message = State()
+    waiting_for_confirmation = State()
+
+
 dp = Dispatcher()
 refresh_lock = asyncio.Lock()
+broadcast_lock = asyncio.Lock()
 
 settings: dict[str, Any] = {}
 schedule: dict[str, Any] = {}
@@ -326,6 +335,12 @@ async def show_admin_panel(callback: types.CallbackQuery) -> bool:
             text="🔄 Обновить расписание", callback_data="admin_update"
         )
     )
+    buttons.row(
+        InlineKeyboardButton(
+            text="📢 Глобальное оповещение",
+            callback_data="admin_broadcast",
+        )
+    )
     buttons.row(InlineKeyboardButton(text="Назад", callback_data="back"))
     admin_value = "true" if _is_admin(user_data, callback.from_user.id) else "false"
     text = (
@@ -368,6 +383,149 @@ async def force_update_callback(callback: types.CallbackQuery) -> None:
             reply_markup=buttons.as_markup(),
             parse_mode="HTML",
         )
+
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def begin_global_broadcast(
+    callback: types.CallbackQuery,
+    state: FSMContext,
+) -> None:
+    user_data = await dbm.check_tg_id(callback.from_user.id)
+    if not _is_admin(user_data, callback.from_user.id):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+    if broadcast_lock.locked():
+        await callback.answer("Другая рассылка уже выполняется", show_alert=True)
+        return
+
+    await state.clear()
+    await state.set_state(BroadcastFlow.waiting_for_message)
+
+    buttons = InlineKeyboardBuilder()
+    buttons.row(
+        InlineKeyboardButton(
+            text="Отмена",
+            callback_data="admin_broadcast_cancel",
+        )
+    )
+    await callback.message.edit_text(
+        "Отправьте сообщение для глобального оповещения.\n\n"
+        "Поддерживаются текст, фото, видео, документы и другие "
+        "обычные сообщения Telegram. Перед рассылкой бот попросит подтверждение.",
+        reply_markup=buttons.as_markup(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_broadcast_cancel")
+async def cancel_global_broadcast(
+    callback: types.CallbackQuery,
+    state: FSMContext,
+) -> None:
+    user_data = await dbm.check_tg_id(callback.from_user.id)
+    if not _is_admin(user_data, callback.from_user.id):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+
+    await state.clear()
+    await show_admin_panel(callback)
+    await callback.answer("Рассылка отменена")
+
+
+@dp.message(BroadcastFlow.waiting_for_message)
+@dp.message(BroadcastFlow.waiting_for_confirmation)
+async def prepare_global_broadcast(
+    message: types.Message,
+    state: FSMContext,
+) -> None:
+    user_data = await dbm.check_tg_id(message.from_user.id)
+    if not _is_admin(user_data, message.from_user.id):
+        await state.clear()
+        await message.answer("Недостаточно прав")
+        return
+
+    recipients = await dbm.get_all_telegram_ids()
+    recipient_count = len(set(recipients))
+    if recipient_count == 0:
+        await state.clear()
+        await message.answer("В базе пока нет пользователей для рассылки")
+        return
+
+    await state.update_data(
+        source_chat_id=message.chat.id,
+        source_message_id=message.message_id,
+    )
+    await state.set_state(BroadcastFlow.waiting_for_confirmation)
+
+    buttons = InlineKeyboardBuilder()
+    buttons.row(
+        InlineKeyboardButton(
+            text=f"✅ Отправить всем ({recipient_count})",
+            callback_data="admin_broadcast_confirm",
+        )
+    )
+    buttons.row(
+        InlineKeyboardButton(
+            text="❌ Отмена",
+            callback_data="admin_broadcast_cancel",
+        )
+    )
+    await message.answer(
+        "Сообщение принято. Отправить его всем зарегистрированным пользователям?",
+        reply_markup=buttons.as_markup(),
+    )
+
+
+@dp.callback_query(
+    BroadcastFlow.waiting_for_confirmation,
+    F.data == "admin_broadcast_confirm",
+)
+async def confirm_global_broadcast(
+    callback: types.CallbackQuery,
+    state: FSMContext,
+) -> None:
+    user_data = await dbm.check_tg_id(callback.from_user.id)
+    if not _is_admin(user_data, callback.from_user.id):
+        await state.clear()
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+    if broadcast_lock.locked():
+        await callback.answer("Другая рассылка уже выполняется", show_alert=True)
+        return
+
+    data = await state.get_data()
+    source_chat_id = data.get("source_chat_id")
+    source_message_id = data.get("source_message_id")
+    if source_chat_id is None or source_message_id is None:
+        await state.clear()
+        await callback.answer("Сообщение для рассылки потеряно", show_alert=True)
+        return
+
+    async with broadcast_lock:
+        await state.clear()
+        recipients = await dbm.get_all_telegram_ids()
+        await callback.answer("Рассылка началась")
+        await callback.message.edit_text(
+            f"Отправляю оповещение пользователям: {len(set(recipients))}…"
+        )
+
+        result = await broadcast_service.copy_message_to_users(
+            callback.bot,
+            recipients,
+            source_chat_id=int(source_chat_id),
+            source_message_id=int(source_message_id),
+        )
+
+    buttons = InlineKeyboardBuilder()
+    buttons.row(InlineKeyboardButton(text="Назад", callback_data="admin"))
+    await callback.message.edit_text(
+        "Глобальное оповещение отправлено.\n\n"
+        f"Всего получателей: {result.total}\n"
+        f"✅ Доставлено: {result.delivered}\n"
+        f"🚫 Бот заблокирован: {result.blocked}\n"
+        f"⚠️ Другие ошибки: {result.failed}",
+        reply_markup=buttons.as_markup(),
+    )
 
 
 @dp.callback_query(F.data == "admin")
