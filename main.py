@@ -23,8 +23,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
+import moduls.backups as backup_service
 import moduls.broadcast as broadcast_service
 import moduls.db as dbm
+import moduls.runtime_settings as runtime_settings
 import moduls.schedule as schedule_source
 import moduls.time as tm
 
@@ -48,6 +50,7 @@ dp = Dispatcher()
 refresh_lock = asyncio.Lock()
 broadcast_lock = asyncio.Lock()
 registration_lock = asyncio.Lock()
+runtime_settings_lock = asyncio.Lock()
 
 settings: dict[str, Any] = {}
 schedule: dict[str, Any] = {}
@@ -128,6 +131,9 @@ async def refresh_schedule() -> schedule_source.UpdateResult:
 
 
 async def scheduled_refresh() -> None:
+    if not runtime_settings.is_auto_update_enabled():
+        LOGGER.info("Автоматическое обновление расписания отключено")
+        return
     if refresh_lock.locked():
         LOGGER.info("Предыдущее обновление ещё идёт, новый запуск пропущен")
         return
@@ -523,10 +529,29 @@ async def show_admin_panel(callback: types.CallbackQuery) -> bool:
         await callback.answer("Недостаточно прав", show_alert=True)
         return False
 
+    auto_update_enabled = runtime_settings.is_auto_update_enabled()
+    backup_count = len(backup_service.list_schedule_backups())
+
     buttons = InlineKeyboardBuilder()
     buttons.row(
         InlineKeyboardButton(
             text="🔄 Обновить расписание", callback_data="admin_update"
+        )
+    )
+    buttons.row(
+        InlineKeyboardButton(
+            text=(
+                "⏱ Автообновление: ВКЛ"
+                if auto_update_enabled
+                else "⏱ Автообновление: ВЫКЛ"
+            ),
+            callback_data="admin_toggle_auto_update",
+        )
+    )
+    buttons.row(
+        InlineKeyboardButton(
+            text=f"💾 Резервные копии ({backup_count})",
+            callback_data="admin_backups",
         )
     )
     buttons.row(
@@ -551,12 +576,202 @@ async def show_admin_panel(callback: types.CallbackQuery) -> bool:
         f"DB ID: {user_data[0]}\n"
         f"Группа: {html.escape(str(user_data[1]))}\n"
         f"Администратор: {admin_value}\n\n"
-        f"{html.escape(_update_status_text())}"
+        f"{html.escape(_update_status_text())}\n"
+        f"Автообновление: "
+        f"{'включено' if auto_update_enabled else 'выключено'}\n"
+        f"Резервных копий: {backup_count}"
     )
     await callback.message.edit_text(
         text, reply_markup=buttons.as_markup(), parse_mode="HTML"
     )
     return True
+
+
+def _backup_reason_label(reason: str) -> str:
+    return {
+        "schedule_update": "перед обновлением",
+        "group_registration": "перед добавлением группы",
+        "before_restore": "перед восстановлением",
+        "manual": "создана вручную",
+    }.get(reason, reason)
+
+
+def _format_backup_time(value: str) -> str:
+    try:
+        moment = datetime.fromisoformat(value).astimezone(
+            ZoneInfo(config.BOT_TIMEZONE)
+        )
+        return f"{moment:%d.%m.%Y %H:%M:%S}"
+    except ValueError:
+        return value or "неизвестное время"
+
+
+@dp.callback_query(F.data == "admin_toggle_auto_update")
+async def toggle_auto_update_callback(callback: types.CallbackQuery) -> None:
+    user_data = await dbm.check_tg_id(callback.from_user.id)
+    if not _is_admin(user_data, callback.from_user.id):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+
+    async with runtime_settings_lock:
+        enabled = runtime_settings.toggle_auto_update()
+    await show_admin_panel(callback)
+    await callback.answer(
+        "Автообновление включено" if enabled else "Автообновление выключено"
+    )
+
+
+async def show_backups_panel(callback: types.CallbackQuery) -> bool:
+    user_data = await dbm.check_tg_id(callback.from_user.id)
+    if not _is_admin(user_data, callback.from_user.id):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return False
+
+    backups = backup_service.list_schedule_backups()
+    buttons = InlineKeyboardBuilder()
+    buttons.row(
+        InlineKeyboardButton(
+            text="➕ Создать копию сейчас",
+            callback_data="admin_backup_create",
+        )
+    )
+    for item in backups:
+        buttons.row(
+            InlineKeyboardButton(
+                text=(
+                    f"{_format_backup_time(item.created_at)} · "
+                    f"{item.group_count} гр."
+                ),
+                callback_data=f"admin_backup_view_{item.backup_id}",
+            )
+        )
+    buttons.row(InlineKeyboardButton(text="Назад", callback_data="admin"))
+
+    text = (
+        f"Резервные копии расписания: {len(backups)}/"
+        f"{config.SCHEDULE_BACKUP_LIMIT}.\n\n"
+        "Копия создаётся автоматически перед каждым успешным обновлением, "
+        "добавлением группы и восстановлением. Логины и пароли в неё не входят."
+    )
+    if not backups:
+        text += "\n\nРезервных копий пока нет."
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=buttons.as_markup(),
+    )
+    return True
+
+
+@dp.callback_query(F.data == "admin_backups")
+async def backups_panel_callback(callback: types.CallbackQuery) -> None:
+    if await show_backups_panel(callback):
+        await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_backup_create")
+async def create_backup_callback(callback: types.CallbackQuery) -> None:
+    user_data = await dbm.check_tg_id(callback.from_user.id)
+    if not _is_admin(user_data, callback.from_user.id):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+    if refresh_lock.locked():
+        await callback.answer(
+            "Сейчас изменяется расписание, попробуйте позже",
+            show_alert=True,
+        )
+        return
+
+    try:
+        async with refresh_lock:
+            info = backup_service.create_schedule_backup("manual")
+    except Exception as exc:  # noqa: BLE001 - show backup failure to admin
+        LOGGER.exception("Не удалось создать резервную копию расписания")
+        await callback.answer(
+            f"Ошибка создания копии: {str(exc)[:150]}",
+            show_alert=True,
+        )
+        return
+
+    await show_backups_panel(callback)
+    await callback.answer(
+        f"Копия от {_format_backup_time(info.created_at)} создана"
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_backup_view_"))
+async def view_backup_callback(callback: types.CallbackQuery) -> None:
+    user_data = await dbm.check_tg_id(callback.from_user.id)
+    if not _is_admin(user_data, callback.from_user.id):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+
+    backup_id = callback.data.removeprefix("admin_backup_view_")
+    try:
+        info = backup_service.get_schedule_backup(backup_id)
+    except backup_service.ScheduleBackupError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+
+    buttons = InlineKeyboardBuilder()
+    buttons.row(
+        InlineKeyboardButton(
+            text="♻️ Восстановить эту копию",
+            callback_data=f"admin_backup_confirm_{backup_id}",
+        )
+    )
+    buttons.row(
+        InlineKeyboardButton(
+            text="Назад к копиям",
+            callback_data="admin_backups",
+        )
+    )
+    await callback.message.edit_text(
+        "Резервная копия расписания\n\n"
+        f"Дата: {_format_backup_time(info.created_at)}\n"
+        f"Причина: {_backup_reason_label(info.reason)}\n"
+        f"Групп: {info.group_count}\n\n"
+        "Перед восстановлением бот автоматически сохранит текущее расписание.",
+        reply_markup=buttons.as_markup(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_backup_confirm_"))
+async def restore_backup_callback(callback: types.CallbackQuery) -> None:
+    user_data = await dbm.check_tg_id(callback.from_user.id)
+    if not _is_admin(user_data, callback.from_user.id):
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+    if refresh_lock.locked():
+        await callback.answer(
+            "Сейчас изменяется расписание, попробуйте позже",
+            show_alert=True,
+        )
+        return
+
+    backup_id = callback.data.removeprefix("admin_backup_confirm_")
+    try:
+        async with refresh_lock:
+            info = backup_service.restore_schedule_backup(backup_id)
+            reload_runtime_data()
+    except Exception as exc:  # noqa: BLE001 - show restore failure to admin
+        LOGGER.exception("Не удалось восстановить расписание из копии")
+        await callback.answer(
+            f"Ошибка восстановления: {str(exc)[:150]}",
+            show_alert=True,
+        )
+        return
+
+    buttons = InlineKeyboardBuilder()
+    buttons.row(InlineKeyboardButton(text="В админ-панель", callback_data="admin"))
+    await callback.message.edit_text(
+        "Расписание восстановлено.\n\n"
+        f"Копия: {_format_backup_time(info.created_at)}\n"
+        f"Групп: {info.group_count}",
+        reply_markup=buttons.as_markup(),
+    )
+    await callback.answer("Восстановление завершено")
 
 
 @dp.callback_query(F.data == "admin_update")
