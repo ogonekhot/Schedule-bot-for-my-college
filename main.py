@@ -649,6 +649,17 @@ async def confirm_global_broadcast(
             source_message_id=int(source_message_id),
         )
 
+        removed_users = 0
+        if result.blocked_recipients:
+            try:
+                removed_users = await dbm.delete_users_by_telegram_ids(
+                    result.blocked_recipients
+                )
+            except Exception:  # noqa: BLE001 - delivery result must still be shown
+                LOGGER.exception(
+                    "Не удалось удалить пользователей, заблокировавших бота"
+                )
+
     buttons = InlineKeyboardBuilder()
     buttons.row(InlineKeyboardButton(text="Назад", callback_data="admin"))
     await callback.message.edit_text(
@@ -656,6 +667,7 @@ async def confirm_global_broadcast(
         f"Всего получателей: {result.total}\n"
         f"✅ Доставлено: {result.delivered}\n"
         f"🚫 Бот заблокирован: {result.blocked}\n"
+        f"🗑 Удалено из базы: {removed_users}\n"
         f"⚠️ Другие ошибки: {result.failed}",
         reply_markup=buttons.as_markup(),
     )
