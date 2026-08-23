@@ -65,3 +65,15 @@ async def update_user_settings(user_id: int, field: str, value: str) -> str:
         raise
     finally:
         conn.close()
+
+async def get_all_telegram_ids() -> list[int]:
+    """Return every unique Telegram chat id registered in the bot."""
+
+    conn = await connect()
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT tg_id FROM users ORDER BY id")
+            rows = await cursor.fetchall()
+        return list(dict.fromkeys(int(row[0]) for row in rows))
+    finally:
+        conn.close()
