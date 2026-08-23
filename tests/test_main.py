@@ -1,7 +1,10 @@
 import asyncio
 
+from aiogram import types
+
 import config
 import main
+from moduls.db import CollegeAccountLink
 
 
 def test_initial_schedule_and_addresses_load() -> None:
@@ -47,3 +50,45 @@ def test_scheduled_refresh_skips_when_auto_update_is_disabled(
 
     assert called is False
 
+
+
+def test_profile_text_shows_personal_lgtu_link_and_escapes_values() -> None:
+    telegram_user = types.User(
+        id=12345,
+        is_bot=False,
+        first_name="<Иван>",
+    )
+    link = CollegeAccountLink(
+        login="s124<&>",
+        group_name="Т9-ИП-24-1",
+    )
+
+    text = main._profile_text(
+        telegram_user,
+        [7, "Т9-ИП-24-1", 0],
+        link,
+    )
+
+    assert "Настройки профиля" in text
+    assert "Статус: ✅ привязан" in text
+    assert "s124&lt;&amp;&gt;" in text
+    assert "<Иван>" not in text
+    assert "password" not in text.casefold()
+    assert "пароль" in text.casefold()
+
+
+def test_profile_text_marks_missing_lgtu_link() -> None:
+    telegram_user = types.User(
+        id=12345,
+        is_bot=False,
+        first_name="Иван",
+    )
+
+    text = main._profile_text(
+        telegram_user,
+        [7, "Т9-ИП-24-1", 0],
+        None,
+    )
+
+    assert "Статус: не привязан" in text
+    assert "Привяжите аккаунт" in text
