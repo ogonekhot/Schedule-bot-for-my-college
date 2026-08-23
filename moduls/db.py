@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 import aiomysql
 
 import config
@@ -97,5 +99,40 @@ async def get_telegram_ids_by_group(group_name: str) -> list[int]:
             )
             rows = await cursor.fetchall()
         return list(dict.fromkeys(int(row[0]) for row in rows))
+    finally:
+        conn.close()
+
+async def delete_users_by_telegram_ids(telegram_ids: Iterable[int]) -> int:
+    """Delete unreachable users and their settings, returning the user count."""
+
+    unique_ids = tuple(dict.fromkeys(int(telegram_id) for telegram_id in telegram_ids))
+    if not unique_ids:
+        return 0
+
+    placeholders = ", ".join(["%s"] * len(unique_ids))
+    conn = await connect()
+    try:
+        async with conn.cursor() as cursor:
+            # Production may use the legacy schema without ON DELETE CASCADE,
+            # so settings are removed explicitly before their users.
+            await cursor.execute(
+                f"""
+                DELETE settings
+                FROM settings
+                INNER JOIN users ON users.id = settings.id
+                WHERE users.tg_id IN ({placeholders})
+                """,
+                unique_ids,
+            )
+            await cursor.execute(
+                f"DELETE FROM users WHERE tg_id IN ({placeholders})",
+                unique_ids,
+            )
+            deleted_users = int(cursor.rowcount)
+        await conn.commit()
+        return deleted_users
+    except Exception:
+        await conn.rollback()
+        raise
     finally:
         conn.close()
