@@ -59,7 +59,7 @@ async def copy_message_to_users(
             except (TelegramBadRequest, TelegramAPIError) as exc:
                 failed += 1
                 LOGGER.warning(
-                    "Не удалось доставить глобальное оповещение пользователю %s: %s",
+                    "Не удалось доставить оповещение пользователю %s: %s",
                     chat_id,
                     exc,
                 )
