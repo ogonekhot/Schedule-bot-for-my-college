@@ -13,6 +13,7 @@ import arrow
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
+from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -38,9 +39,15 @@ class BroadcastFlow(StatesGroup):
     waiting_for_confirmation = State()
 
 
+class RegistrationFlow(StatesGroup):
+    waiting_for_login = State()
+    waiting_for_password = State()
+
+
 dp = Dispatcher()
 refresh_lock = asyncio.Lock()
 broadcast_lock = asyncio.Lock()
+registration_lock = asyncio.Lock()
 
 settings: dict[str, Any] = {}
 schedule: dict[str, Any] = {}
@@ -142,12 +149,6 @@ async def check_registration(event: types.Message | types.CallbackQuery) -> bool
     else:
         send = event.message.edit_text
 
-    if not groups:
-        await send(
-            "Расписание пока не загружено. Попробуйте ещё раз через несколько минут."
-        )
-        return False
-
     buttons = InlineKeyboardBuilder()
     for group in groups:
         buttons.row(
@@ -156,7 +157,21 @@ async def check_registration(event: types.Message | types.CallbackQuery) -> bool
                 callback_data=f"settings_group_{group}",
             )
         )
-    await send("Для начала выберите вашу группу:", reply_markup=buttons.as_markup())
+    buttons.row(
+        InlineKeyboardButton(
+            text="➕ Добавить свою группу",
+            callback_data="registration_add_group",
+        )
+    )
+
+    if groups:
+        text = "Для начала выберите вашу группу или добавьте новую:"
+    else:
+        text = (
+            "Расписание пока не загружено. Можно добавить свою группу "
+            "с помощью аккаунта личного кабинета."
+        )
+    await send(text, reply_markup=buttons.as_markup())
     return False
 
 
@@ -296,14 +311,193 @@ async def schedule_manager(callback: types.CallbackQuery) -> None:
 
 
 @dp.callback_query(F.data.startswith("settings_group_"))
-async def settings_manager(callback: types.CallbackQuery) -> None:
+async def settings_manager(
+    callback: types.CallbackQuery,
+    state: FSMContext,
+) -> None:
     group = callback.data.removeprefix("settings_group_")
     if group not in _available_groups():
         await callback.answer("Такой группы больше нет", show_alert=True)
         return
+    await state.clear()
     user_id = (await dbm.check_tg_id(callback.from_user.id))[0]
     message = await dbm.update_user_settings(user_id, "group_name", group)
     await start(callback, callback_notice=message)
+
+
+def _registration_cancel_keyboard():
+    buttons = InlineKeyboardBuilder()
+    buttons.row(
+        InlineKeyboardButton(
+            text="Отмена",
+            callback_data="registration_cancel",
+        )
+    )
+    return buttons.as_markup()
+
+
+async def _delete_sensitive_message(message: types.Message) -> None:
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        LOGGER.warning(
+            "Не удалось удалить сообщение с учётными данными пользователя %s",
+            message.from_user.id,
+        )
+
+
+@dp.callback_query(F.data == "registration_add_group")
+async def begin_group_registration(
+    callback: types.CallbackQuery,
+    state: FSMContext,
+) -> None:
+    user_data = await dbm.check_tg_id(callback.from_user.id)
+    if len(user_data) > 1 and user_data[1] is not None:
+        await state.clear()
+        await callback.answer("Вы уже зарегистрированы", show_alert=True)
+        return
+    if callback.message.chat.type != ChatType.PRIVATE:
+        await callback.answer(
+            "Добавлять группу можно только в личном чате с ботом",
+            show_alert=True,
+        )
+        return
+    if registration_lock.locked():
+        await callback.answer(
+            "Сейчас проверяется другой аккаунт. Попробуйте немного позже.",
+            show_alert=True,
+        )
+        return
+
+    await state.clear()
+    await state.set_state(RegistrationFlow.waiting_for_login)
+    await callback.message.edit_text(
+        "Отправьте логин от личного кабинета колледжа.\n\n"
+        "Сообщение будет сразу удалено. Пароль новой группы хранится только "
+        "на сервере бота в закрытом runtime-файле и нужен для автоматического "
+        "обновления расписания.",
+        reply_markup=_registration_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "registration_cancel")
+async def cancel_group_registration(
+    callback: types.CallbackQuery,
+    state: FSMContext,
+) -> None:
+    await state.clear()
+    await check_registration(callback)
+    await callback.answer("Добавление группы отменено")
+
+
+@dp.message(RegistrationFlow.waiting_for_login)
+async def receive_college_login(
+    message: types.Message,
+    state: FSMContext,
+) -> None:
+    value = message.text or message.caption or ""
+    await _delete_sensitive_message(message)
+    login = value.strip()
+    if not login or len(login) > 256:
+        await message.answer(
+            "Логин пустой или слишком длинный. Отправьте корректный логин.",
+            reply_markup=_registration_cancel_keyboard(),
+        )
+        return
+
+    await state.update_data(college_login=login)
+    await state.set_state(RegistrationFlow.waiting_for_password)
+    await message.answer(
+        "Теперь отправьте пароль от личного кабинета. "
+        "Сообщение с паролем тоже будет сразу удалено.",
+        reply_markup=_registration_cancel_keyboard(),
+    )
+
+
+@dp.message(RegistrationFlow.waiting_for_password)
+async def receive_college_password(
+    message: types.Message,
+    state: FSMContext,
+) -> None:
+    value = message.text or message.caption or ""
+    await _delete_sensitive_message(message)
+    password = value.strip()
+    data = await state.get_data()
+    login = str(data.get("college_login", "")).strip()
+    await state.clear()
+
+    if not login or not password or len(password) > 256:
+        await message.answer(
+            "Логин или пароль пустой либо слишком длинный. Начните заново.",
+            reply_markup=InlineKeyboardBuilder()
+            .button(text="Попробовать снова", callback_data="registration_add_group")
+            .as_markup(),
+        )
+        return
+    if registration_lock.locked():
+        await message.answer(
+            "Другой аккаунт уже проверяется. Введённые данные удалены, "
+            "попробуйте снова немного позже.",
+            reply_markup=InlineKeyboardBuilder()
+            .button(text="Попробовать снова", callback_data="registration_add_group")
+            .as_markup(),
+        )
+        return
+
+    status = await message.answer(
+        "Проверяю аккаунт и получаю расписание. Это может занять несколько минут…"
+    )
+    try:
+        async with registration_lock:
+            async with refresh_lock:
+                result = await schedule_source.register_schedule_account(
+                    login,
+                    password,
+                )
+                reload_runtime_data()
+                user_id = (await dbm.check_tg_id(message.from_user.id))[0]
+                await dbm.update_user_settings(
+                    user_id,
+                    "group_name",
+                    result.group,
+                )
+    except Exception as exc:  # noqa: BLE001 - show safe scraper errors to the user
+        LOGGER.warning(
+            "Не удалось добавить группу для пользователя %s: %s",
+            message.from_user.id,
+            exc,
+        )
+        buttons = InlineKeyboardBuilder()
+        buttons.row(
+            InlineKeyboardButton(
+                text="Попробовать снова",
+                callback_data="registration_add_group",
+            )
+        )
+        buttons.row(
+            InlineKeyboardButton(
+                text="Выбрать готовую группу",
+                callback_data="registration_cancel",
+            )
+        )
+        await status.edit_text(
+            "Не удалось проверить аккаунт. Логин и пароль не сохранены.\n\n"
+            f"Ошибка: {str(exc)[:700]}",
+            reply_markup=buttons.as_markup(),
+        )
+        return
+    finally:
+        login = ""
+        password = ""
+
+    action = "добавлена в бот" if result.account_added else "уже была в боте"
+    await status.edit_text(
+        f"Группа «{result.group}» {action}. Вы успешно зарегистрированы."
+    )
+    await start(message)
+
+
 
 
 def _update_status_text() -> str:
