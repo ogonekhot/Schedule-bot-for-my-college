@@ -479,7 +479,10 @@ async def begin_group_broadcast(
 
     try:
         group_index = int(callback.data.removeprefix("admin_broadcast_group_"))
-        group = _available_groups()[group_index]
+        groups = _available_groups()
+        if not 0 <= group_index < len(groups):
+            raise IndexError
+        group = groups[group_index]
     except (ValueError, IndexError):
         await callback.answer("Такая группа больше недоступна", show_alert=True)
         return
