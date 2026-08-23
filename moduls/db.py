@@ -77,3 +77,25 @@ async def get_all_telegram_ids() -> list[int]:
         return list(dict.fromkeys(int(row[0]) for row in rows))
     finally:
         conn.close()
+
+
+async def get_telegram_ids_by_group(group_name: str) -> list[int]:
+    """Return unique Telegram chat ids whose saved group matches group_name."""
+
+    conn = await connect()
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT users.tg_id
+                FROM users
+                INNER JOIN settings ON settings.id = users.id
+                WHERE settings.group_name = %s
+                ORDER BY users.id
+                """,
+                (group_name,),
+            )
+            rows = await cursor.fetchall()
+        return list(dict.fromkeys(int(row[0]) for row in rows))
+    finally:
+        conn.close()
