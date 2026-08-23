@@ -311,6 +311,7 @@ async def start(
 
     buttons = InlineKeyboardBuilder()
     buttons.row(InlineKeyboardButton(text="Расписание", callback_data="schedule"))
+    buttons.row(InlineKeyboardButton(text="👤 Профиль", callback_data="profile"))
     if _is_admin(user_data, event.from_user.id):
         buttons.row(InlineKeyboardButton(text="Админ-панель", callback_data="admin"))
 
@@ -322,6 +323,84 @@ async def start(
             text, reply_markup=buttons.as_markup(), parse_mode="HTML"
         )
         await event.answer(callback_notice)
+
+
+def _profile_text(
+    telegram_user: types.User,
+    user_data: list,
+    account_link: dbm.CollegeAccountLink | None,
+) -> str:
+    group_name = (
+        html.escape(str(user_data[1]))
+        if len(user_data) > 1 and user_data[1] is not None
+        else "не выбрана"
+    )
+    lines = [
+        "👤 <b>Настройки профиля</b>",
+        "",
+        f"Имя: {html.escape(telegram_user.full_name)}",
+        f"Telegram ID: <code>{telegram_user.id}</code>",
+        f"Группа расписания: {group_name}",
+        "",
+        "<b>Аккаунт ЛГТУ</b>",
+    ]
+    if account_link is None:
+        lines.extend(
+            [
+                "Статус: не привязан",
+                "Привяжите аккаунт, чтобы бот проверил его и определил вашу группу.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "Статус: ✅ привязан",
+                f"Логин: <code>{html.escape(account_link.login)}</code>",
+                f"Группа аккаунта: {html.escape(account_link.group_name)}",
+                "Пароль в профиле не хранится и не показывается.",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _profile_keyboard(linked: bool):
+    buttons = InlineKeyboardBuilder()
+    buttons.row(
+        InlineKeyboardButton(
+            text=(
+                "🔄 Изменить привязку ЛГТУ"
+                if linked
+                else "🔗 Привязать аккаунт ЛГТУ"
+            ),
+            callback_data="profile_link_lgtu",
+        )
+    )
+    buttons.row(InlineKeyboardButton(text="Назад", callback_data="back"))
+    return buttons.as_markup()
+
+
+async def show_profile(callback: types.CallbackQuery) -> bool:
+    if callback.message.chat.type != ChatType.PRIVATE:
+        await callback.answer(
+            "Профиль доступен только в личном чате с ботом",
+            show_alert=True,
+        )
+        return False
+
+    user_data = await dbm.check_tg_id(callback.from_user.id)
+    account_link = await dbm.get_college_account_link(int(user_data[0]))
+    await callback.message.edit_text(
+        _profile_text(callback.from_user, user_data, account_link),
+        reply_markup=_profile_keyboard(account_link is not None),
+        parse_mode="HTML",
+    )
+    return True
+
+
+@dp.callback_query(F.data == "profile")
+async def profile_callback(callback: types.CallbackQuery) -> None:
+    if await show_profile(callback):
+        await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("schedule"))
@@ -387,12 +466,45 @@ async def settings_manager(
     await start(callback, callback_notice=message)
 
 
-def _registration_cancel_keyboard():
+def _registration_cancel_keyboard(return_to_profile: bool = False):
     buttons = InlineKeyboardBuilder()
     buttons.row(
         InlineKeyboardButton(
             text="Отмена",
-            callback_data="registration_cancel",
+            callback_data=(
+                "registration_cancel_profile"
+                if return_to_profile
+                else "registration_cancel"
+            ),
+        )
+    )
+    return buttons.as_markup()
+
+
+def _registration_retry_keyboard(return_to_profile: bool):
+    buttons = InlineKeyboardBuilder()
+    buttons.row(
+        InlineKeyboardButton(
+            text="Попробовать снова",
+            callback_data=(
+                "profile_link_lgtu"
+                if return_to_profile
+                else "registration_add_group"
+            ),
+        )
+    )
+    buttons.row(
+        InlineKeyboardButton(
+            text=(
+                "Вернуться в профиль"
+                if return_to_profile
+                else "Выбрать готовую группу"
+            ),
+            callback_data=(
+                "registration_cancel_profile"
+                if return_to_profile
+                else "registration_cancel"
+            ),
         )
     )
     return buttons.as_markup()
@@ -408,13 +520,19 @@ async def _delete_sensitive_message(message: types.Message) -> None:
         )
 
 
+@dp.callback_query(F.data == "profile_link_lgtu")
 @dp.callback_query(F.data == "registration_add_group")
 async def begin_group_registration(
     callback: types.CallbackQuery,
     state: FSMContext,
 ) -> None:
+    return_to_profile = callback.data == "profile_link_lgtu"
     user_data = await dbm.check_tg_id(callback.from_user.id)
-    if len(user_data) > 1 and user_data[1] is not None:
+    if (
+        len(user_data) > 1
+        and user_data[1] is not None
+        and not return_to_profile
+    ):
         await state.clear()
         await callback.answer("Вы уже зарегистрированы", show_alert=True)
         return
@@ -432,25 +550,36 @@ async def begin_group_registration(
         return
 
     await state.clear()
+    await state.update_data(registration_return_to_profile=return_to_profile)
     await state.set_state(RegistrationFlow.waiting_for_login)
     await callback.message.edit_text(
         "Отправьте логин от личного кабинета колледжа.\n\n"
-        "Сообщение будет сразу удалено. Пароль новой группы хранится только "
-        "на сервере бота в закрытом runtime-файле и нужен для автоматического "
-        "обновления расписания.",
-        reply_markup=_registration_cancel_keyboard(),
+        "Сообщение будет сразу удалено. После проверки в профиле сохранится "
+        "только логин и найденная группа. Если группа новая, пароль сохранится "
+        "только в закрытом runtime-файле для автообновления расписания; "
+        "в профиль и таблицу пользователей он не попадёт.",
+        reply_markup=_registration_cancel_keyboard(return_to_profile),
     )
     await callback.answer()
 
 
+@dp.callback_query(F.data == "registration_cancel_profile")
 @dp.callback_query(F.data == "registration_cancel")
 async def cancel_group_registration(
     callback: types.CallbackQuery,
     state: FSMContext,
 ) -> None:
+    data = await state.get_data()
+    return_to_profile = (
+        callback.data == "registration_cancel_profile"
+        or bool(data.get("registration_return_to_profile"))
+    )
     await state.clear()
-    await check_registration(callback)
-    await callback.answer("Добавление группы отменено")
+    if return_to_profile:
+        await show_profile(callback)
+    else:
+        await check_registration(callback)
+    await callback.answer("Привязка аккаунта отменена")
 
 
 @dp.message(RegistrationFlow.waiting_for_login)
@@ -461,10 +590,12 @@ async def receive_college_login(
     value = message.text or message.caption or ""
     await _delete_sensitive_message(message)
     login = value.strip()
+    data = await state.get_data()
+    return_to_profile = bool(data.get("registration_return_to_profile"))
     if not login or len(login) > 256:
         await message.answer(
             "Логин пустой или слишком длинный. Отправьте корректный логин.",
-            reply_markup=_registration_cancel_keyboard(),
+            reply_markup=_registration_cancel_keyboard(return_to_profile),
         )
         return
 
@@ -473,7 +604,7 @@ async def receive_college_login(
     await message.answer(
         "Теперь отправьте пароль от личного кабинета. "
         "Сообщение с паролем тоже будет сразу удалено.",
-        reply_markup=_registration_cancel_keyboard(),
+        reply_markup=_registration_cancel_keyboard(return_to_profile),
     )
 
 
@@ -487,23 +618,20 @@ async def receive_college_password(
     password = value.strip()
     data = await state.get_data()
     login = str(data.get("college_login", "")).strip()
+    return_to_profile = bool(data.get("registration_return_to_profile"))
     await state.clear()
 
     if not login or not password or len(password) > 256:
         await message.answer(
             "Логин или пароль пустой либо слишком длинный. Начните заново.",
-            reply_markup=InlineKeyboardBuilder()
-            .button(text="Попробовать снова", callback_data="registration_add_group")
-            .as_markup(),
+            reply_markup=_registration_retry_keyboard(return_to_profile),
         )
         return
     if registration_lock.locked():
         await message.answer(
             "Другой аккаунт уже проверяется. Введённые данные удалены, "
             "попробуйте снова немного позже.",
-            reply_markup=InlineKeyboardBuilder()
-            .button(text="Попробовать снова", callback_data="registration_add_group")
-            .as_markup(),
+            reply_markup=_registration_retry_keyboard(return_to_profile),
         )
         return
 
@@ -519,9 +647,9 @@ async def receive_college_password(
                 )
                 reload_runtime_data()
                 user_id = (await dbm.check_tg_id(message.from_user.id))[0]
-                await dbm.update_user_settings(
+                await dbm.save_user_group_and_college_account_link(
                     user_id,
-                    "group_name",
+                    login,
                     result.group,
                 )
     except Exception as exc:  # noqa: BLE001 - show safe scraper errors to the user
@@ -530,23 +658,10 @@ async def receive_college_password(
             message.from_user.id,
             exc,
         )
-        buttons = InlineKeyboardBuilder()
-        buttons.row(
-            InlineKeyboardButton(
-                text="Попробовать снова",
-                callback_data="registration_add_group",
-            )
-        )
-        buttons.row(
-            InlineKeyboardButton(
-                text="Выбрать готовую группу",
-                callback_data="registration_cancel",
-            )
-        )
         await status.edit_text(
             "Не удалось проверить аккаунт. Логин и пароль не сохранены.\n\n"
             f"Ошибка: {str(exc)[:700]}",
-            reply_markup=buttons.as_markup(),
+            reply_markup=_registration_retry_keyboard(return_to_profile),
         )
         return
     finally:
@@ -554,10 +669,21 @@ async def receive_college_password(
         password = ""
 
     action = "добавлена в бот" if result.account_added else "уже была в боте"
-    await status.edit_text(
-        f"Группа «{result.group}» {action}. Вы успешно зарегистрированы."
-    )
-    await start(message)
+    if return_to_profile:
+        buttons = InlineKeyboardBuilder()
+        buttons.row(
+            InlineKeyboardButton(text="👤 Открыть профиль", callback_data="profile")
+        )
+        buttons.row(InlineKeyboardButton(text="Главное меню", callback_data="back"))
+        await status.edit_text(
+            f"Аккаунт ЛГТУ привязан. Группа «{result.group}» {action}.",
+            reply_markup=buttons.as_markup(),
+        )
+    else:
+        await status.edit_text(
+            f"Группа «{result.group}» {action}. Вы успешно зарегистрированы."
+        )
+        await start(message)
 
 
 
@@ -1179,6 +1305,7 @@ async def delete_user_message(message: types.Message) -> None:
 
 async def main() -> None:
     config.validate_runtime_config()
+    await dbm.ensure_profile_schema()
     reload_runtime_data()
     bot = build_bot()
     scheduler = AsyncIOScheduler(timezone=config.BOT_TIMEZONE)
@@ -1236,3 +1363,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
