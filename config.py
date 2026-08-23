@@ -52,6 +52,13 @@ REFERENCE_FILE = _path_env("REFERENCE_FILE", str(DATA_DIR / "reference.json"))
 SCHEDULE_ACCOUNTS_FILE = _path_env(
     "SCHEDULE_ACCOUNTS_FILE", str(DATA_DIR / "accounts.json")
 )
+RUNTIME_SETTINGS_FILE = _path_env(
+    "RUNTIME_SETTINGS_FILE", str(DATA_DIR / "runtime-settings.json")
+)
+SCHEDULE_BACKUP_DIR = _path_env(
+    "SCHEDULE_BACKUP_DIR", str(DATA_DIR / "backups")
+)
+SCHEDULE_BACKUP_LIMIT = _int_env("SCHEDULE_BACKUP_LIMIT", 10)
 
 # College site and automatic updates
 COLLEGE_LOGIN_URL = os.getenv("COLLEGE_LOGIN_URL", "http://lk.stu.lipetsk.ru/").strip()
@@ -61,6 +68,9 @@ COLLEGE_SCHEDULE_URL = os.getenv(
 ).strip()
 SCHEDULE_BROWSER = os.getenv("SCHEDULE_BROWSER", "chromium").strip().lower()
 SCHEDULE_HEADLESS = _bool_env("SCHEDULE_HEADLESS", True)
+SCHEDULE_AUTO_UPDATE_ENABLED = _bool_env(
+    "SCHEDULE_AUTO_UPDATE_ENABLED", True
+)
 SCHEDULE_UPDATE_ON_STARTUP = _bool_env("SCHEDULE_UPDATE_ON_STARTUP", True)
 SCHEDULE_UPDATE_INTERVAL_MINUTES = _int_env(
     "SCHEDULE_UPDATE_INTERVAL_MINUTES", 360, minimum=5
