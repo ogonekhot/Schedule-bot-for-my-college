@@ -10,6 +10,7 @@ from moduls.schedule import (
     ScheduleUpdateError,
     _persist_verified_account,
     detect_group_name,
+    is_stalled_college_asset,
     parse_schedule_html,
 )
 
@@ -171,3 +172,33 @@ def test_existing_group_credentials_are_not_saved(monkeypatch, tmp_path) -> None
     assert added is False
     assert accounts_file.exists() is False
 
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://lk.stu.lipetsk.ru/local/templates/main/assets/js/bootstrap.min.js",
+        (
+            "http://lk.stu.lipetsk.ru/local/templates/main/assets/js/"
+            "main-1.69.js?rnd=123456"
+        ),
+    ],
+)
+def test_known_stalled_college_assets_are_blocked(url: str) -> None:
+    assert is_stalled_college_asset(url) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://lk.stu.lipetsk.ru/local/templates/main/assets/js/jquery.min.js",
+        (
+            "http://lk.stu.lipetsk.ru/bitrix/cache/js/s1/auth/"
+            "page_auth.js?17412662901824"
+        ),
+        "http://lk.stu.lipetsk.ru/index.php",
+        "http://lk.stu.lipetsk.ru/ajax.handler.php",
+    ],
+)
+def test_login_and_schedule_requests_remain_enabled(url: str) -> None:
+    assert is_stalled_college_asset(url) is False
