@@ -26,3 +26,24 @@ def test_local_bot_api_url(monkeypatch) -> None:
         "http://localhost:8081/bot"
     )
     asyncio.run(bot.session.close())
+
+def test_scheduled_refresh_skips_when_auto_update_is_disabled(
+    monkeypatch,
+) -> None:
+    called = False
+
+    async def fake_refresh_schedule():
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(
+        main.runtime_settings,
+        "is_auto_update_enabled",
+        lambda: False,
+    )
+    monkeypatch.setattr(main, "refresh_schedule", fake_refresh_schedule)
+
+    asyncio.run(main.scheduled_refresh())
+
+    assert called is False
+

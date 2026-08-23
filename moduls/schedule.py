@@ -26,6 +26,7 @@ from playwright.async_api import (
 )
 
 import config
+from moduls.backups import create_schedule_backup
 
 LOGGER = logging.getLogger(__name__)
 
@@ -402,6 +403,7 @@ def _persist_verified_account(
 
     cached_schedule = _load_schedule_cache()
     cached_schedule[group] = group_schedule
+    create_schedule_backup("group_registration")
     _atomic_json_dump(config.SCHEDULE_FILE, cached_schedule)
 
     if account_added:
@@ -487,6 +489,7 @@ async def update_schedule() -> UpdateResult:
         "updated_at": now.isoformat(timespec="seconds"),
     }
 
+    create_schedule_backup("schedule_update")
     _atomic_json_dump(config.SCHEDULE_FILE, new_schedule)
     _atomic_json_dump(config.REFERENCE_FILE, state)
     return UpdateResult(
