@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup, Tag
@@ -19,6 +20,7 @@ from playwright.async_api import (
     Browser,
     Page,
     Response,
+    Route,
     async_playwright,
 )
 from playwright.async_api import (
@@ -50,6 +52,27 @@ LESSON_TYPES = {
     "лек.": "лекция",
     "лаб.": "лабораторная",
 }
+
+STALLED_COLLEGE_ASSET_PATHS = frozenset(
+    {
+        "/local/templates/main/assets/js/bootstrap.min.js",
+        "/local/templates/main/assets/js/main-1.69.js",
+    }
+)
+
+
+def is_stalled_college_asset(url: str) -> bool:
+    """Return whether this known broken asset must not block HTML parsing."""
+
+    return urlsplit(url).path in STALLED_COLLEGE_ASSET_PATHS
+
+
+async def _route_college_request(route: Route) -> None:
+    if is_stalled_college_asset(route.request.url):
+        LOGGER.debug("Пропущен зависающий ресурс ЛГТУ: %s", route.request.url)
+        await route.abort()
+        return
+    await route.continue_()
 
 
 class ScheduleUpdateError(RuntimeError):
@@ -247,6 +270,7 @@ async def _fetch_group(
 ) -> tuple[dict[str, dict[str, Any]], str | None, str | None]:
     context = await browser.new_context(ignore_https_errors=True)
     page = await context.new_page()
+    await page.route("**/*", _route_college_request)
     timeout_ms = config.SCHEDULE_PAGE_TIMEOUT_SECONDS * 1000
     page.set_default_timeout(timeout_ms)
 
