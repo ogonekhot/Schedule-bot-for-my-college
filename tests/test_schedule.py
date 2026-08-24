@@ -1,5 +1,7 @@
+import asyncio
 import json
 import stat
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +12,7 @@ from moduls.schedule import (
     ScheduleUpdateError,
     _persist_verified_account,
     _persist_recovered_group,
+    _recovery_route,
     _redact_recovery_value,
     detect_group_name,
     parse_schedule_html,
@@ -237,3 +240,36 @@ def test_recovery_redaction_hides_both_credentials() -> None:
         {"login": "student", "password": "very-secret"},
     ) == "LOGIN=<hidden>&PASSWORD=<hidden>"
 
+
+
+
+class _FakeRecoveryRoute:
+    def __init__(self, url: str, resource_type: str = "script") -> None:
+        self.request = SimpleNamespace(url=url, resource_type=resource_type)
+        self.action: str | None = None
+
+    async def abort(self) -> None:
+        self.action = "abort"
+
+    async def continue_(self) -> None:
+        self.action = "continue"
+
+
+def test_recovery_route_allows_required_schedule_bootstrap() -> None:
+    route = _FakeRecoveryRoute(
+        "http://lk.stu.lipetsk.ru/local/templates/main/assets/js/main-1.69.js"
+    )
+
+    asyncio.run(_recovery_route(route))
+
+    assert route.action == "continue"
+
+
+def test_recovery_route_still_blocks_nonessential_bootstrap() -> None:
+    route = _FakeRecoveryRoute(
+        "http://lk.stu.lipetsk.ru/local/templates/main/assets/js/bootstrap.min.js"
+    )
+
+    asyncio.run(_recovery_route(route))
+
+    assert route.action == "abort"
