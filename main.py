@@ -286,7 +286,11 @@ async def render_schedule(
             f"{html.escape(str(lesson_time.get('end', '')))}</b>:"
         )
         if details.get("title"):
-            lines.append(html.escape(str(details["title"])))
+            lines.append(
+                html.escape(
+                    schedule_source.normalize_lesson_title(str(details["title"]))
+                )
+            )
         if details.get("teacher"):
             lines.append(html.escape(str(details["teacher"])))
         room = _format_room(details.get("room", ""), details.get("type", ""))

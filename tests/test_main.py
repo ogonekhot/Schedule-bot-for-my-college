@@ -15,6 +15,41 @@ def test_initial_schedule_and_addresses_load() -> None:
     assert main._format_room("9-208", "лекция") == "9-й корпус 208 лекция"
 
 
+def test_render_schedule_normalizes_legacy_uppercase_title(monkeypatch) -> None:
+    async def fake_check_tg_id(_user_id):
+        return [1, "Т9-ИП-24-1", 0]
+
+    async def fake_weekday(*_args, **_kwargs):
+        return "ПН", "Зелёная неделя"
+
+    monkeypatch.setattr(main.dbm, "check_tg_id", fake_check_tg_id)
+    monkeypatch.setattr(main.tm, "get_this_weekday", fake_weekday)
+    monkeypatch.setattr(
+        main,
+        "schedule",
+        {
+            "Т9-ИП-24-1": {
+                "ПН": {
+                    "1": {
+                        "time": {"start": "13:20", "end": "14:50"},
+                        "Зелёная неделя": {
+                            "title": "ЭЛЕКТРОТЕХНИКА",
+                            "teacher": "Пшеничников Дмитрий Сергеевич",
+                            "room": "411",
+                            "type": "лабораторная",
+                        },
+                    }
+                }
+            }
+        },
+    )
+
+    rendered = asyncio.run(main.render_schedule(123))
+
+    assert "Электротехника" in rendered
+    assert "ЭЛЕКТРОТЕХНИКА" not in rendered
+
+
 def test_local_bot_api_url(monkeypatch) -> None:
     monkeypatch.setattr(
         config,

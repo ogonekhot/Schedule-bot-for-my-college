@@ -52,6 +52,9 @@ REFERENCE_FILE = _path_env("REFERENCE_FILE", str(DATA_DIR / "reference.json"))
 SCHEDULE_ACCOUNTS_FILE = _path_env(
     "SCHEDULE_ACCOUNTS_FILE", str(DATA_DIR / "accounts.json")
 )
+SCHEDULE_SOURCE_CACHE_FILE = _path_env(
+    "SCHEDULE_SOURCE_CACHE_FILE", str(DATA_DIR / "schedule-source-cache.json")
+)
 RUNTIME_SETTINGS_FILE = _path_env(
     "RUNTIME_SETTINGS_FILE", str(DATA_DIR / "runtime-settings.json")
 )
