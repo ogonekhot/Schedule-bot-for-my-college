@@ -368,10 +368,12 @@ def _recovery_playwright_cookies(
 async def _recovery_route(route: Route) -> None:
     request = route.request
     path = urlsplit(request.url).path.casefold()
+    # The college schedule bootstrap depends on main-1.69.js.  It used to
+    # stall while the site was unhealthy, but blocking it also prevents the
+    # authenticated page from issuing its schedule AJAX request.
     blocked_scripts = (
         "/bootstrap.min.js",
         "/jquery.maskedinput.min.js",
-        "/main-1.69.js",
         "/ba.js",
     )
     if request.resource_type in {"image", "media", "font", "stylesheet"}:
