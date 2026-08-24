@@ -9,12 +9,18 @@ import config
 from moduls.schedule import (
     GREEN_WEEK,
     WHITE_WEEK,
+    ScheduleRequestDescriptor,
     ScheduleUpdateError,
+    _cached_schedule_request,
     _persist_verified_account,
     _persist_recovered_group,
     _recovery_route,
     _redact_recovery_value,
+    _remember_schedule_request,
+    _request_schedule_directly,
+    _schedule_request_descriptor_from_metadata,
     detect_group_name,
+    normalize_lesson_title,
     parse_schedule_html,
     recovery_is_complete,
 )
@@ -32,7 +38,7 @@ SCHEDULE_HTML = """
     </tr>
     <tr>
       <td>09:40 – 11:10</td>
-      <td>Информатика</td>
+      <td>ИНФОРМАТИКА</td>
       <td>305<br>пр.</td>
     </tr>
     <tr>
@@ -62,8 +68,24 @@ def test_parse_schedule_html() -> None:
         "room": "9-208",
         "type": "лабораторная",
     }
+    assert result["ПН"]["2"][WHITE_WEEK]["title"] == "Информатика"
     assert result["ПН"]["2"][WHITE_WEEK]["type"] == "практика"
     assert result["ВТ"]["1"][WHITE_WEEK]["teacher"] == "Сидоров Сидор Сидорович"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("ЭЛЕКТРОТЕХНИКА", "Электротехника"),
+        (
+            "АДМИНИСТРИРОВАНИЕ В ОС LINUX",
+            "Администрирование в ОС Linux",
+        ),
+        ("Основы SQL", "Основы SQL"),
+    ],
+)
+def test_normalize_lesson_title(source: str, expected: str) -> None:
+    assert normalize_lesson_title(source) == expected
 
 
 @pytest.mark.parametrize("html", ["", "<div>сайт временно недоступен</div>"])
@@ -241,6 +263,98 @@ def test_recovery_redaction_hides_both_credentials() -> None:
     ) == "LOGIN=<hidden>&PASSWORD=<hidden>"
 
 
+class _FakeHttpResponse:
+    def __init__(self, body: str, url: str) -> None:
+        self._body = body.encode("utf-8")
+        self.url = url
+        self.status = 200
+
+    async def read(self) -> bytes:
+        return self._body
+
+
+class _FakeRequestContext:
+    def __init__(self, response: _FakeHttpResponse) -> None:
+        self.response = response
+
+    async def __aenter__(self) -> _FakeHttpResponse:
+        return self.response
+
+    async def __aexit__(self, *_args) -> None:
+        return None
+
+
+class _FakeHttpSession:
+    def __init__(self) -> None:
+        self.post_kwargs = None
+
+    def get(self, url: str, **_kwargs) -> _FakeRequestContext:
+        page = '<div role="alert">Сейчас зелёная неделя</div>'
+        return _FakeRequestContext(_FakeHttpResponse(page, url))
+
+    def post(self, url: str, **kwargs) -> _FakeRequestContext:
+        self.post_kwargs = {"url": url, **kwargs}
+        return _FakeRequestContext(_FakeHttpResponse(SCHEDULE_HTML, url))
+
+
+def test_schedule_request_descriptor_and_cache(monkeypatch, tmp_path) -> None:
+    schedule_url = "http://lk.stu.lipetsk.ru/education/0/5:143027436/"
+    descriptor = _schedule_request_descriptor_from_metadata(
+        {
+            "url": "http://lk.stu.lipetsk.ru/ajax.handler.php",
+            "page_url": schedule_url,
+            "post_data": (
+                "student_schedule=1&semester=5%3A143027436"
+                "&group=5%3A130743009"
+            ),
+        }
+    )
+
+    assert descriptor == ScheduleRequestDescriptor(
+        endpoint_url="http://lk.stu.lipetsk.ru/ajax.handler.php",
+        schedule_url=schedule_url,
+        semester_id="5:143027436",
+        group_id="5:130743009",
+    )
+
+    cache_file = tmp_path / "schedule-source-cache.json"
+    monkeypatch.setattr(config, "SCHEDULE_SOURCE_CACHE_FILE", cache_file)
+    monkeypatch.setattr(config, "COLLEGE_SCHEDULE_URL", schedule_url)
+    monkeypatch.setattr(config, "BOT_TIMEZONE", "Europe/Moscow")
+    _remember_schedule_request("Т9-ИП-24-1", descriptor)
+
+    assert _cached_schedule_request("Т9-ИП-24-1") == descriptor
+    assert stat.S_IMODE(cache_file.stat().st_mode) == 0o600
+
+    monkeypatch.setattr(
+        config,
+        "COLLEGE_SCHEDULE_URL",
+        "http://lk.stu.lipetsk.ru/education/0/next-semester/",
+    )
+    assert _cached_schedule_request("Т9-ИП-24-1") is None
+
+
+def test_direct_schedule_request_uses_discovered_ids() -> None:
+    descriptor = ScheduleRequestDescriptor(
+        endpoint_url="http://lk.stu.lipetsk.ru/ajax.handler.php",
+        schedule_url="http://lk.stu.lipetsk.ru/education/0/5:143027436/",
+        semester_id="5:143027436",
+        group_id="5:130743009",
+    )
+    session = _FakeHttpSession()
+
+    ajax_html, _page_html, color, metadata = asyncio.run(
+        _request_schedule_directly(session, descriptor)
+    )
+
+    assert "<tbody>" in ajax_html
+    assert color == GREEN_WEEK
+    assert session.post_kwargs["data"] == {
+        "student_schedule": "1",
+        "semester": "5:143027436",
+        "group": "5:130743009",
+    }
+    assert metadata["transport"] == "direct-aiohttp"
 
 
 class _FakeRecoveryRoute:

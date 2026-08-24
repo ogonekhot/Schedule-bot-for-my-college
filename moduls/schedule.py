@@ -12,13 +12,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
 import aiohttp
 from bs4 import BeautifulSoup, Tag
 from playwright.async_api import (
-    Browser,
     Page,
     Route,
     Response,
@@ -53,6 +52,21 @@ LESSON_TYPES = {
     "лек.": "лекция",
     "лаб.": "лабораторная",
 }
+TITLE_ACRONYMS = {
+    "api": "API",
+    "бд": "БД",
+    "ис": "ИС",
+    "лгту": "ЛГТУ",
+    "ос": "ОС",
+    "субд": "СУБД",
+    "эвм": "ЭВМ",
+    "css": "CSS",
+    "html": "HTML",
+    "js": "JS",
+    "linux": "Linux",
+    "php": "PHP",
+    "sql": "SQL",
+}
 
 
 class ScheduleUpdateError(RuntimeError):
@@ -81,6 +95,33 @@ class UpdateResult:
 class RecoveryResult:
     update: UpdateResult
     capture_dir: Path
+
+
+@dataclass(frozen=True)
+class ScheduleRequestDescriptor:
+    endpoint_url: str
+    schedule_url: str
+    semester_id: str
+    group_id: str
+
+
+def normalize_lesson_title(value: str) -> str:
+    """Fix accidental ALL-CAPS titles without damaging mixed-case names."""
+
+    cleaned = re.sub(r"\s+", " ", str(value)).strip()
+    letters = [character for character in cleaned if character.isalpha()]
+    if not letters or not all(character.isupper() for character in letters):
+        return cleaned
+
+    normalized = cleaned.lower()
+    normalized = re.sub(
+        r"[A-Za-zА-Яа-яЁё]+",
+        lambda match: TITLE_ACRONYMS.get(match.group(0), match.group(0)),
+        normalized,
+    )
+    if normalized and normalized[0].isalpha():
+        normalized = normalized[0].upper() + normalized[1:]
+    return normalized
 
 
 def _empty_lesson(start: str, end: str) -> dict[str, Any]:
@@ -145,13 +186,13 @@ def parse_schedule_html(html: str) -> dict[str, dict[str, Any]]:
             lesson["room"] = lines[0]
             lesson["type"] = lesson_type
         elif len(lines) >= 3:
-            lesson["title"] = lines[0]
+            lesson["title"] = normalize_lesson_title(lines[0])
             lesson["teacher"] = lines[-1]
         elif len(lines) == 2:
-            lesson["title"] = lines[0]
+            lesson["title"] = normalize_lesson_title(lines[0])
             lesson["teacher"] = lines[1]
         else:
-            lesson["title"] = lines[0]
+            lesson["title"] = normalize_lesson_title(lines[0])
 
     lesson_count = sum(len(day) for day in result.values())
     if not result or lesson_count == 0:
@@ -195,6 +236,172 @@ def _decode_body(body: bytes) -> str:
         except UnicodeDecodeError:
             continue
     return body.decode("cp1251", errors="replace")
+
+
+def _schedule_request_descriptor_from_metadata(
+    metadata: dict[str, Any],
+) -> ScheduleRequestDescriptor:
+    post_data = str(metadata.get("post_data", ""))
+    values = parse_qs(post_data, keep_blank_values=True)
+    semester_id = values.get("semester", [""])[0].strip()
+    group_id = values.get("group", [""])[0].strip()
+    student_schedule = values.get("student_schedule", [""])[0].strip()
+    endpoint_url = str(metadata.get("url", "")).strip()
+    schedule_url = str(
+        metadata.get("page_url") or config.COLLEGE_SCHEDULE_URL
+    ).strip()
+
+    if (
+        student_schedule != "1"
+        or not semester_id
+        or not group_id
+        or not endpoint_url
+        or not schedule_url
+    ):
+        raise ScheduleUpdateError(
+            "не удалось определить ID семестра и группы из AJAX-запроса"
+        )
+    return ScheduleRequestDescriptor(
+        endpoint_url=endpoint_url,
+        schedule_url=schedule_url,
+        semester_id=semester_id,
+        group_id=group_id,
+    )
+
+
+def _load_schedule_request_cache() -> dict[str, dict[str, str]]:
+    path = config.SCHEDULE_SOURCE_CACHE_FILE
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8-sig") as file:
+            value = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        LOGGER.warning("Не удалось прочитать кеш ID расписания %s", path)
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _cached_schedule_request(group: str) -> ScheduleRequestDescriptor | None:
+    value = _load_schedule_request_cache().get(group)
+    if not isinstance(value, dict):
+        return None
+    try:
+        descriptor = ScheduleRequestDescriptor(
+            endpoint_url=str(value["endpoint_url"]),
+            schedule_url=str(value["schedule_url"]),
+            semester_id=str(value["semester_id"]),
+            group_id=str(value["group_id"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    configured_url = config.COLLEGE_SCHEDULE_URL.rstrip("/")
+    cached_configured_url = str(
+        value.get("configured_schedule_url", descriptor.schedule_url)
+    ).rstrip("/")
+    if cached_configured_url != configured_url:
+        return None
+    return descriptor
+
+
+def _remember_schedule_request(
+    group: str,
+    descriptor: ScheduleRequestDescriptor,
+) -> None:
+    cache = _load_schedule_request_cache()
+    cache[group] = {
+        "endpoint_url": descriptor.endpoint_url,
+        "schedule_url": descriptor.schedule_url,
+        "semester_id": descriptor.semester_id,
+        "group_id": descriptor.group_id,
+        "configured_schedule_url": config.COLLEGE_SCHEDULE_URL,
+        "discovered_at": datetime.now(ZoneInfo(config.BOT_TIMEZONE)).isoformat(
+            timespec="seconds"
+        ),
+    }
+    _atomic_json_dump(config.SCHEDULE_SOURCE_CACHE_FILE, cache)
+    os.chmod(config.SCHEDULE_SOURCE_CACHE_FILE, 0o600)
+
+
+async def _request_schedule_directly(
+    session: aiohttp.ClientSession,
+    descriptor: ScheduleRequestDescriptor,
+) -> tuple[str, str, str | None, dict[str, Any]]:
+    """Fetch the schedule through the same lightweight AJAX endpoint as the UI."""
+
+    async with session.get(
+        descriptor.schedule_url,
+        allow_redirects=True,
+    ) as response:
+        page_body = await response.read()
+        page_url = str(response.url)
+        if response.status != 200:
+            raise ScheduleUpdateError(
+                f"страница расписания вернула HTTP {response.status}"
+            )
+
+    page_html = _decode_body(page_body)
+    if BeautifulSoup(page_html, "html.parser").select_one(
+        "input[name='LOGIN']"
+    ) is not None:
+        raise ScheduleUpdateError(
+            "PHP-сессия потерялась при переходе к расписанию"
+        )
+
+    endpoint_parts = urlsplit(descriptor.endpoint_url)
+    origin = f"{endpoint_parts.scheme}://{endpoint_parts.netloc}"
+    payload = {
+        "student_schedule": "1",
+        "semester": descriptor.semester_id,
+        "group": descriptor.group_id,
+    }
+    async with session.post(
+        descriptor.endpoint_url,
+        data=payload,
+        headers={
+            "Accept": "*/*",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": origin,
+            "Referer": page_url,
+        },
+        allow_redirects=False,
+    ) as response:
+        ajax_body = await response.read()
+        ajax_html = _decode_body(ajax_body)
+        if response.status != 200:
+            raise ScheduleUpdateError(
+                f"AJAX расписания вернул HTTP {response.status}"
+            )
+
+    if "<tbody" not in ajax_html.casefold():
+        raise ScheduleUpdateError(
+            "сохранённые ID расписания устарели или сайт вернул пустой AJAX-ответ"
+        )
+
+    metadata = {
+        "url": descriptor.endpoint_url,
+        "method": "POST",
+        "post_data": (
+            "student_schedule=1"
+            f"&semester={descriptor.semester_id}"
+            f"&group={descriptor.group_id}"
+        ),
+        "headers": {
+            "origin": origin,
+            "referer": page_url,
+            "x-requested-with": "XMLHttpRequest",
+        },
+        "response_status": 200,
+        "page_url": descriptor.schedule_url,
+        "transport": "direct-aiohttp",
+    }
+    return (
+        ajax_html,
+        page_html,
+        _read_week_color_html(page_html),
+        metadata,
+    )
 
 
 def recovery_is_complete(group: str | None = None) -> bool:
@@ -603,7 +810,9 @@ async def recover_priority_group() -> RecoveryResult:
     finally:
         await session.close()
 
+    descriptor = _schedule_request_descriptor_from_metadata(request_metadata)
     group_schedule = parse_schedule_html(ajax_html)
+    _remember_schedule_request(group, descriptor)
     capture_dir = _write_recovery_capture(
         group,
         credentials,
@@ -627,49 +836,10 @@ async def recover_priority_group() -> RecoveryResult:
     return RecoveryResult(update=update, capture_dir=capture_dir)
 
 
-async def _wait_for_schedule_response(page: Page) -> str:
-    loop = asyncio.get_running_loop()
-    response_future: asyncio.Future[str] = loop.create_future()
-
-    async def capture(response: Response) -> None:
-        if "ajax.handler.php" not in response.url or response_future.done():
-            return
-        try:
-            text = _decode_body(await response.body())
-            if "<td" in text.casefold() or "<tbody" in text.casefold():
-                response_future.set_result(text)
-        except Exception as exc:  # noqa: BLE001  # pragma: no cover
-            LOGGER.debug("Не удалось прочитать AJAX-ответ %s: %s", response.url, exc)
-
-    page.on("response", capture)
-    timeout_ms = config.SCHEDULE_PAGE_TIMEOUT_SECONDS * 1000
-    try:
-        await page.goto(
-            config.COLLEGE_SCHEDULE_URL,
-            wait_until="domcontentloaded",
-            timeout=timeout_ms,
-        )
-        try:
-            return await asyncio.wait_for(
-                asyncio.shield(response_future),
-                timeout=config.SCHEDULE_PAGE_TIMEOUT_SECONDS,
-            )
-        except (TimeoutError, PlaywrightTimeoutError):
-            LOGGER.info(
-                "AJAX-ответ не пришёл после перехода, пробуем обновить страницу"
-            )
-            await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
-            return await asyncio.wait_for(
-                asyncio.shield(response_future),
-                timeout=config.SCHEDULE_PAGE_TIMEOUT_SECONDS,
-            )
-    finally:
-        page.remove_listener("response", capture)
-
-
-async def _read_week_color(page: Page) -> str | None:
-    for text in await page.locator("div[role=alert]").all_text_contents():
-        normalized = text.casefold().replace("ё", "е")
+def _read_week_color_html(document: str) -> str | None:
+    soup = BeautifulSoup(document, "html.parser")
+    for alert in soup.select("div[role=alert]"):
+        normalized = alert.get_text(" ", strip=True).casefold().replace("ё", "е")
         if "белая" in normalized:
             return WHITE_WEEK
         if "зеленая" in normalized:
@@ -677,65 +847,79 @@ async def _read_week_color(page: Page) -> str | None:
     return None
 
 
+async def _read_week_color(page: Page) -> str | None:
+    return _read_week_color_html(await page.content())
+
+
 async def _fetch_group(
-    browser: Browser,
     group: str | None,
     credentials: dict[str, str],
     *,
     detect_group: bool = False,
 ) -> tuple[dict[str, dict[str, Any]], str | None, str | None]:
-    context = await browser.new_context(ignore_https_errors=True)
-    page = await context.new_page()
-    timeout_ms = config.SCHEDULE_PAGE_TIMEOUT_SECONDS * 1000
-    page.set_default_timeout(timeout_ms)
-
+    session, authenticated_html, authenticated_url = (
+        await _authenticate_recovery_session(credentials)
+    )
     try:
-        await page.goto(
-            config.COLLEGE_LOGIN_URL,
-            wait_until="domcontentloaded",
-            timeout=timeout_ms,
+        descriptor = _cached_schedule_request(group) if group else None
+        if descriptor is not None:
+            try:
+                ajax_html, page_html, week_color, _ = (
+                    await _request_schedule_directly(session, descriptor)
+                )
+                detected_group = (
+                    detect_group_name(
+                        authenticated_html,
+                        page_html,
+                        ajax_html,
+                    )
+                    if detect_group
+                    else None
+                )
+                return (
+                    parse_schedule_html(ajax_html),
+                    week_color,
+                    detected_group,
+                )
+            except ScheduleCredentialsError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - rediscovery is the fallback
+                LOGGER.warning(
+                    "Прямой AJAX для группы %s не сработал, "
+                    "обновляем ID через Playwright: %s",
+                    group,
+                    exc,
+                )
+
+        ajax_html, page_html, week_color, request_metadata = (
+            await _capture_recovery_schedule(session, credentials)
         )
-        await page.locator('input[name="LOGIN"]').fill(credentials["login"])
-        await page.locator('input[name="PASSWORD"]').fill(credentials["password"])
-        await page.locator('button[type="submit"]').click()
-        try:
-            await page.wait_for_load_state("networkidle", timeout=timeout_ms)
-        except PlaywrightTimeoutError:
-            LOGGER.debug("После входа networkidle не наступил, продолжаем")
-
-        login_field = page.locator('input[name="LOGIN"]')
-        if await login_field.count() and await login_field.first.is_visible():
-            prefix = f"группа {group}: " if group else ""
-            raise ScheduleCredentialsError(
-                f"{prefix}сайт не принял логин или пароль"
-            )
-
-        authenticated_html = await page.content()
-        ajax_html = await _wait_for_schedule_response(page)
-        schedule_page_html = await page.content()
-        week_color = await _read_week_color(page)
+        descriptor = _schedule_request_descriptor_from_metadata(request_metadata)
         detected_group = (
             detect_group_name(
                 authenticated_html,
-                schedule_page_html,
+                page_html,
                 ajax_html,
             )
             if detect_group
             else None
         )
-        return parse_schedule_html(ajax_html), week_color, detected_group
+        group_schedule = parse_schedule_html(ajax_html)
+        cache_group = group or detected_group
+        if cache_group:
+            _remember_schedule_request(cache_group, descriptor)
+        return group_schedule, week_color, detected_group
     finally:
-        await context.close()
+        await session.close()
 
 
 async def _fetch_group_with_retries(
-    browser: Browser, group: str, credentials: dict[str, str]
+    group: str, credentials: dict[str, str]
 ) -> tuple[dict[str, dict[str, Any]], str | None]:
     last_error: Exception | None = None
     for attempt in range(1, config.SCHEDULE_UPDATE_MAX_ATTEMPTS + 1):
         try:
             group_schedule, color, _ = await _fetch_group(
-                browser,
                 group,
                 credentials,
             )
@@ -757,14 +941,12 @@ async def _fetch_group_with_retries(
 
 
 async def _verify_account_with_retries(
-    browser: Browser,
     credentials: dict[str, str],
 ) -> tuple[dict[str, dict[str, Any]], str | None, str]:
     last_error: Exception | None = None
     for attempt in range(1, config.SCHEDULE_UPDATE_MAX_ATTEMPTS + 1):
         try:
             group_schedule, color, group = await _fetch_group(
-                browser,
                 None,
                 credentials,
                 detect_group=True,
@@ -867,16 +1049,7 @@ async def register_schedule_account(
         raise ScheduleCredentialsError("логин или пароль слишком длинный")
 
     credentials = {"login": login, "password": password}
-    async with async_playwright() as playwright:
-        browser_type = getattr(playwright, config.SCHEDULE_BROWSER)
-        browser = await browser_type.launch(headless=config.SCHEDULE_HEADLESS)
-        try:
-            group_schedule, _, group = await _verify_account_with_retries(
-                browser,
-                credentials,
-            )
-        finally:
-            await browser.close()
+    group_schedule, _, group = await _verify_account_with_retries(credentials)
 
     account_added = _persist_verified_account(
         group,
@@ -902,19 +1075,13 @@ async def update_schedule() -> UpdateResult:
     new_schedule: dict[str, dict[str, Any]] = {}
     detected_colors: list[str] = []
 
-    async with async_playwright() as playwright:
-        browser_type = getattr(playwright, config.SCHEDULE_BROWSER)
-        browser = await browser_type.launch(headless=config.SCHEDULE_HEADLESS)
-        try:
-            for group, credentials in accounts.items():
-                group_schedule, color = await _fetch_group_with_retries(
-                    browser, group, credentials
-                )
-                new_schedule[group] = group_schedule
-                if color:
-                    detected_colors.append(color)
-        finally:
-            await browser.close()
+    for group, credentials in accounts.items():
+        group_schedule, color = await _fetch_group_with_retries(
+            group, credentials
+        )
+        new_schedule[group] = group_schedule
+        if color:
+            detected_colors.append(color)
 
     fallback_color = settings.get("references", {}).get("color", WHITE_WEEK)
     reference_color = detected_colors[0] if detected_colors else fallback_color
